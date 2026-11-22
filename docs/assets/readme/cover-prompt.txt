@@ -1,1 +1,30 @@
-Create a polished horizontal GitHub README cover for the open-source Turkish project "SeroBeyinn" (SeroBeyinn). Wide 2.5:1 composition, ideally 1920x768. Purpose: explain that multiple AI coding assistants share the user's own Markdown notes. It is a conceptual cover illustration, NOT a fake application screenshot. Premium, restrained editorial design with tangible layered paper/document objects, thin precise connections, subtle depth, ample negative space. Near-black forest charcoal background (#101713), warm off-white typography and papers, sharp lime green accents (#d1f56b). Left 48%: large clean sans-serif title, exactly "SeroBeyinn", split into two lines if needed. Small brand line above exactly "SEROBEYINN". Below title, readable subtitle exactly "Farklı ajanlar. Aynı notlar." Right 48%: a central slightly isometric folder of Markdown notes, three crisp off-white page cards with tiny understated content lines and clear small ".md" marks, connected by a few lime paths to three small neutral terminal-window silhouettes. This represents client connections, not cloud upload. Bottom subtle single line exactly "Markdown · Yerel hafıza · Açık kaynak". Keep Turkish dotted capital İ correct. At least 70 px safe margins. Text must remain readable scaled to 800px wide. No brains, no humanoid robots, no anthropomorphic mascots, no neon glow, no gradients across the title, no busy circuit backdrop, no vendor logos, no code wall, no badges, no stats, no extra text, no watermark. This needs to feel like a carefully art-directed software project cover, calm, clean and useful.
+SeroBeyinn README kapağı — tasarım tarifi
+
+Amaç: birden çok AI ajanının kullanıcının kendi Markdown notlarını paylaştığını
+anlatan, sakin ve editoryal bir kapak. Gerçek ürün ekranı değil, kavramsal illüstrasyon.
+
+Tuval: 1983 × 793 piksel (yaklaşık 2.5:1), en az 70 px güvenli kenar.
+
+Zemin: orman yeşili-siyah (#0d1310), sağ üstte hafif radyal aydınlanma (#16211a),
+sol altta çok hafif ikinci radyal geçiş. Üzerine %5 opaklıkta ince grain.
+
+Sol blok (yaklaşık %48):
+- Küçük marka satırı: "SEROBEYİNN", 15 px, kalın, 0.22em harf aralığı, lime (#d3f56b).
+- Altında 58 × 4 px lime çizgi.
+- Büyük başlık: "SeroBeyinn", 132 px, kalın, -0.045em harf aralığı, kırık beyaz (#f4f1e8).
+- Alt başlık: "Farklı ajanlar. Aynı notlar.", 35 px, açık gri (#c7cec2).
+
+Sağ blok (yaklaşık %48):
+- Arkada sade, koyu bir klasör paneli (ince kenarlık, üstte küçük sekme).
+- Üst üste üç kırık beyaz Markdown sayfası (292 × 372), hafif döndürülmüş
+  (7°, 1.5°, -6°), yumuşak gölgeli. Her sayfada "· md" işareti, dört ince içerik
+  çizgisi ve alt etiket: notlar / kararlar / görevler.
+- Sayfaların sağ kenarından üç küçük terminal penceresine (214 × 124) ince lime
+  bezier bağlantı çizgileri; uçlarında lime nokta. Pencerelerde üç nokta ve "> _".
+  Bu, istemci bağlantısını temsil eder; buluta yükleme değildir.
+
+Alt orta: "Markdown · Yerel hafıza · Açık kaynak", 22 px, soluk gri (#7f887c).
+
+Yasaklar: beyin görseli, humanoid robot, maskot, neon parıltı, başlıkta gradyan,
+kalabalık devre fonu, sağlayıcı logosu, kod duvarı, rozet, istatistik, fazladan
+metin, filigran. Türkçe noktalı büyük İ doğru yazılmalı (SEROBEYİNN).
