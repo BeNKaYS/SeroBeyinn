@@ -89,6 +89,9 @@ meter { width: 100%; height: 10px; }
   overflow: hidden; height: 68vh; min-height: 360px; }
 #graf-tuval { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
 #graf-tuval:active { cursor: grabbing; }
+.graf-ikili { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr); gap: 16px; align-items: start; }
+.graf-sag { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+#graf-icerik { max-height: 68vh; margin: 0; }
 .graf-aciklama { margin-top: 10px; }
 .graf-lejant { display: flex; gap: 14px; flex-wrap: wrap; color: var(--soluk); font-size: 12px; }
 .graf-lejant i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
@@ -97,6 +100,7 @@ meter { width: 100%; height: 10px; }
 .graf-lejant .n-receipts { background: #67df70; }
 .graf-lejant .n-companion { background: #ffb4ab; }
 .graf-lejant .n-diger { background: #8b949e; }
+@media (max-width: 1100px) { .graf-ikili { grid-template-columns: 1fr; } #graf-icerik { max-height: 50vh; } }
 @media (max-width: 760px) { .kabuk { grid-template-columns: 1fr; } .yan { position: static; height: auto; } .ikili { grid-template-columns: 1fr; } }
 """
 
@@ -530,16 +534,36 @@ APP_JS = r"""
     return en;
   }
 
+  let grafIcerikIstek = 0;
+  async function grafIcerik(yol) {
+    const kutu = $('graf-icerik');
+    const istek = ++grafIcerikIstek;
+    kutu.textContent = 'Yükleniyor…';
+    try {
+      const not = await api('/api/not?yol=' + encodeURIComponent(yol));
+      if (istek !== grafIcerikIstek) { return; }
+      kutu.textContent = not.metin || '(boş not)';
+      if (not.kisaltildi) { kutu.textContent += '\n\n… (not kısaltıldı)'; }
+    } catch (error) {
+      if (istek === grafIcerikIstek) { kutu.textContent = error.message; }
+    }
+  }
+
   function grafSec(durum, n) {
     durum.secili = n ? n.veri.id : null;
     const kutu = $('graf-secim');
-    if (!n) { kutu.hidden = true; return; }
+    if (!n) {
+      kutu.hidden = true;
+      $('graf-icerik').textContent = 'Bir nota tıklayın…';
+      return;
+    }
     kutu.hidden = false;
     kutu.replaceChildren(
       el('div', { class: 'etiket', text: n.veri.tur }),
       el('h2', { text: n.veri.baslik }),
       el('p', { class: 'ust-bilgi', text: n.veri.id })
     );
+    grafIcerik(n.veri.id);
   }
 
   function grafDongu(tuval, durum, ctx, dpr) {
@@ -554,26 +578,35 @@ APP_JS = r"""
   }
 
   function grafEtkilesim(tuval, durum) {
-    let surukle = null, pan = null;
+    let basla = null;
     tuval.addEventListener('pointerdown', function (olay) {
       tuval.setPointerCapture(olay.pointerId);
-      const n = grafBul(durum, olay);
-      if (n) { durum.sabit = n; grafSec(durum, n); }
-      else if (durum.secili) { grafSec(durum, null); }
-      else { pan = { x: olay.clientX, y: olay.clientY, panX: durum.panX, panY: durum.panY }; }
-      surukle = n;
+      basla = { x: olay.clientX, y: olay.clientY, panX: durum.panX, panY: durum.panY,
+        dugum: grafBul(durum, olay), tasindi: false };
+      if (basla.dugum) { durum.sabit = basla.dugum; }
     });
     tuval.addEventListener('pointermove', function (olay) {
-      if (surukle) {
+      if (!basla) { return; }
+      const dx = olay.clientX - basla.x, dy = olay.clientY - basla.y;
+      if (Math.abs(dx) + Math.abs(dy) > 4) { basla.tasindi = true; }
+      if (basla.dugum) {
         const rect = tuval.getBoundingClientRect();
-        surukle.x = (olay.clientX - rect.left - durum.panX) / durum.olcek;
-        surukle.y = (olay.clientY - rect.top - durum.panY) / durum.olcek;
-      } else if (pan) {
-        durum.panX = pan.panX + (olay.clientX - pan.x);
-        durum.panY = pan.panY + (olay.clientY - pan.y);
+        basla.dugum.x = (olay.clientX - rect.left - durum.panX) / durum.olcek;
+        basla.dugum.y = (olay.clientY - rect.top - durum.panY) / durum.olcek;
+        basla.dugum.vx = 0; basla.dugum.vy = 0;
+      } else {
+        durum.panX = basla.panX + dx;
+        durum.panY = basla.panY + dy;
       }
     });
-    const bitir = function () { surukle = null; pan = null; durum.sabit = null; };
+    const bitir = function () {
+      if (basla && !basla.tasindi) {
+        if (basla.dugum) { grafSec(durum, basla.dugum); }
+        else { grafSec(durum, null); }
+      }
+      basla = null;
+      durum.sabit = null;
+    };
     tuval.addEventListener('pointerup', bitir);
     tuval.addEventListener('pointercancel', bitir);
     tuval.addEventListener('wheel', function (olay) {
@@ -766,20 +799,27 @@ _INDEX = """<!DOCTYPE html>
     </section>
     <section id="gorunum-graf" class="gorunum" hidden>
       <h1>Graf</h1>
-      <p class="aciklama">Vault'taki Markdown notları ve aralarındaki bağlantılar. Düğüme tıklayınca not yolu görünür; boş alanı sürükleyerek gezin, tekerlekle yakınlaştır.</p>
-      <div class="arac-cubugu">
-        <button id="graf-yenile" type="button" class="ikincil">Yenile</button>
-        <span id="graf-notu" class="aciklama"></span>
-        <span class="graf-lejant" aria-hidden="true">
-          <span><i class="n-knowledge"></i>knowledge</span>
-          <span><i class="n-daily"></i>daily</span>
-          <span><i class="n-receipts"></i>receipts</span>
-          <span><i class="n-companion"></i>companion</span>
-          <span><i class="n-diger"></i>diğer</span>
-        </span>
+      <p class="aciklama">Vault'taki Markdown notları ve aralarındaki bağlantılar. Bir düğüme tıklayınca sağda notun içeriği açılır; boş alanı sürükleyerek gezin, tekerlekle yakınlaştır.</p>
+      <div class="graf-ikili">
+        <div>
+          <div class="arac-cubugu">
+            <button id="graf-yenile" type="button" class="ikincil">Yenile</button>
+            <span id="graf-notu" class="aciklama"></span>
+            <span class="graf-lejant" aria-hidden="true">
+              <span><i class="n-knowledge"></i>knowledge</span>
+              <span><i class="n-daily"></i>daily</span>
+              <span><i class="n-receipts"></i>receipts</span>
+              <span><i class="n-companion"></i>companion</span>
+              <span><i class="n-diger"></i>diğer</span>
+            </span>
+          </div>
+          <div class="graf-kutu"><canvas id="graf-tuval" aria-label="Not bağlantı grafiği"></canvas></div>
+        </div>
+        <aside class="graf-sag">
+          <div id="graf-secim" class="kart" hidden></div>
+          <pre id="graf-icerik" class="onizleme">Bir nota tıklayın…</pre>
+        </aside>
       </div>
-      <div class="graf-kutu"><canvas id="graf-tuval" aria-label="Not bağlantı grafiği"></canvas></div>
-      <div id="graf-secim" class="kart graf-aciklama" hidden></div>
     </section>
   </main>
 </div>

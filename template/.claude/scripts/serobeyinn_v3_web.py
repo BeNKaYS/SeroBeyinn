@@ -175,6 +175,25 @@ def _graph(core):
             'kenarlar': [{'kaynak': source, 'hedef': target} for source, target in sorted(edges)]}
 
 
+def _note(core, relative):
+    """Graf düğümünün ham Markdown metni; kasa dışı ve gizli yollar reddedilir."""
+    vault = Path(getattr(core, 'vault', '.')).resolve()
+    if not isinstance(relative, str) or not relative.strip():
+        raise WebError(400, 'Not yolu gerekli')
+    target = (vault / relative).resolve()
+    try:
+        rel = target.relative_to(vault).as_posix()
+    except ValueError:
+        raise WebError(400, 'Kasa dışı yol')
+    parts = rel.split('/')
+    if any(part.startswith('.') or part in _GRAPH_SKIP for part in parts):
+        raise WebError(403, 'Bu not gösterilmiyor')
+    if target.suffix.lower() != '.md' or not target.is_file():
+        raise WebError(404, 'Not bulunamadı')
+    text = target.read_text(encoding='utf-8', errors='replace')
+    return {'yol': rel, 'metin': text[:200000], 'kisaltildi': len(text) > 200000}
+
+
 def task_view(record):
     priority = record.get('priority')
     return {
@@ -584,6 +603,7 @@ class Handler(BaseHTTPRequestHandler):
             '/api/makbuzlar': core.receipts,
             '/api/hafiza': core.memory,
             '/api/graf': lambda: _graph(core),
+            '/api/not': lambda: _note(core, query.get('yol', [''])[0]),
             '/api/gozden-gecir': core.review,
         }
         self._route(routes.get(url.path))
