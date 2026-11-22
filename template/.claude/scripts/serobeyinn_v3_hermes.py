@@ -1,0 +1,543 @@
+"""Hermes Agent plugin for SeroBeyinn V3: same hook contract, no model or network calls.
+
+Hermes (NousResearch/hermes-agent) loads plugins from ``~/.hermes/plugins/<name>/``
+and calls ``register(ctx)``. This module is the vault-owned implementation; the
+plugin directory only needs a thin ``__init__.py`` that locates the vault and
+imports this file (see ``plan_plugin`` and ``docs/v3/HERMES.md``).
+
+Hook contract (verified against hermes-agent ``agent/turn_context.py`` and
+``hermes_cli/cli_session_mixin.py``):
+
+* ``pre_llm_call(session_id, turn_id, user_message, is_first_turn)`` — returning
+  ``{"context": text}`` injects ``text`` into that turn's user message. This is the
+  only supported injection channel, so V3 context arrives here: ``SessionStart`` on
+  the first turn, ``UserPromptSubmit`` afterwards.
+* ``on_session_finalize(session_id)`` — the real session boundary (shutdown,
+  ``/new``, ``/reset``). It queues ``SessionEnd`` so receipt-gap tracking works the
+  same way it does for Claude Code and Codex.
+
+Everything runs through ``serobeyinn_v3_hook.py`` as a subprocess with ``--harness
+hermes``: one lifecycle adapter, one preference file, one health file for every
+client. The subprocess waits at most ``HOOK_TIMEOUT`` so a stalled sync cannot hold
+a Hermes turn beyond that budget. Failures the adapter handles itself land in its
+``hook-error.json`` and surface through ``doctor``; transport failures (spawn,
+timeout, exit status, malformed output) happen outside the adapter, so they are
+logged through Hermes' plugin logger instead and the turn proceeds without context.
+"""
+from __future__ import annotations
+
+from contextlib import contextmanager
+import errno
+import hashlib
+import json
+import math
+import logging
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import time
+
+HOOK_TIMEOUT = 20 if os.name == "nt" else 6
+PLUGIN_NAME = "serobeyinn-v3"
+LOGGER = logging.getLogger(__name__)
+# Sessions nobody sits in front of (scheduled jobs, chat bots) never submit receipts, so
+# their SessionEnd must not be counted as a checkpoint: otherwise every later interactive
+# start warns about "missing receipts" for work that was never receipt-shaped. Hermes
+# reports a generic platform at finalize, so the platform seen on the first turn is kept.
+DEFAULT_UNATTENDED_PLATFORMS = frozenset({"a2a", "cron", "telegram", "discord", "slack", "whatsapp", "signal", "matrix", "email", "sms", "webhook"})
+UNATTENDED_PLATFORMS = DEFAULT_UNATTENDED_PLATFORMS
+# Only cwd-less gateway sessions use the vault as a project fallback. Attendance
+# configuration can name custom channels, but never makes a local surface a bot.
+GATEWAY_PLATFORMS = DEFAULT_UNATTENDED_PLATFORMS
+LOCAL_PLATFORMS = frozenset({"cli", "tui", "gui", "desktop", "acp", "tool", "oneshot"})
+SETTINGS_FILE = "hermes-platforms.json"
+VAULT_SETTINGS_FILE = ".serobeyinn-hermes.json"
+# Same cadence as the V2 nudge: remind a long interactive session to write a receipt.
+REMINDER_EVERY = 15
+REMINDER = "[Hafıza] {n}. mesaj. Anlamlı iş bittiyse `serobeyinn.py receipt --harness hermes` ile kaynak bağlantılı makbuz yaz."
+# Per-session turn count and first-turn platform, kept in state so a gateway restart neither
+# resets the reminder cadence nor forgets that a running chat session is unattended.
+TURNS_FILE = "hermes-turns.json"
+TURNS_LOCK = "hermes-turns.lock"
+TURNS_LOCK_TIMEOUT = 1.0
+TURNS_KEEP_SECONDS = 7 * 86400
+TURNS_KEEP_MAX = 200
+
+
+def _clean_platforms(items):
+    if not isinstance(items, (list, tuple, set)):
+        return []
+    res = []
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            clean = item.strip().lower()
+            if clean not in res:
+                res.append(clean)
+    return sorted(res)
+
+
+def read_platforms(state=None, vault=None):
+    """(settings, valid).
+
+    Returns a dict with 'attended' and 'unattended' lists, and a validity bool.
+    Missing settings file returns empty lists and True.
+    A damaged or invalid JSON file returns empty lists and False (fails open).
+    """
+    path = None
+    if state:
+        path = Path(state) / SETTINGS_FILE
+    if not path or not path.exists():
+        return {"attended": [], "unattended": []}, True
+    if path.is_symlink():
+        return {"attended": [], "unattended": []}, False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"attended": [], "unattended": []}, False
+        for key in ("attended", "unattended"):
+            values = data.get(key, [])
+            if not isinstance(values, list) or any(not isinstance(p, str) or not p.strip() for p in values):
+                return {"attended": [], "unattended": []}, False
+        attended = _clean_platforms(data.get("attended", []))
+        unattended = _clean_platforms(data.get("unattended", []))
+        return {"attended": attended, "unattended": unattended}, True
+    except (ValueError, OSError, TypeError):
+        return {"attended": [], "unattended": []}, False
+
+
+def resolve_unattended_platforms(vault=None, state=None):
+    """Resolve effective set of unattended platforms."""
+    conf, _ = read_platforms(state=state, vault=vault)
+    effective = set(DEFAULT_UNATTENDED_PLATFORMS)
+    effective.difference_update(conf.get("attended", []))
+    effective.update(conf.get("unattended", []))
+    return frozenset(effective)
+
+
+def save_platforms(state, attended=None, unattended=None, reset=False):
+    """Save machine-local platform configuration atomically in state.
+
+    If reset=True, removes the state settings file and returns defaults.
+    """
+    state = Path(state)
+    state.mkdir(parents=True, exist_ok=True)
+    path = state / SETTINGS_FILE
+    if reset:
+        if path.exists():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        return {"attended": [], "unattended": [], "effective_unattended": sorted(DEFAULT_UNATTENDED_PLATFORMS)}
+
+    current, _ = read_platforms(state=state)
+    new_attended = set(current.get("attended", []))
+    new_unattended = set(current.get("unattended", []))
+
+    if attended:
+        for p in _clean_platforms(attended):
+            new_attended.add(p)
+            new_unattended.discard(p)
+    if unattended:
+        for p in _clean_platforms(unattended):
+            new_unattended.add(p)
+            new_attended.discard(p)
+
+    data = {
+        "schema": 1,
+        "attended": sorted(new_attended),
+        "unattended": sorted(new_unattended),
+    }
+
+    import tempfile
+    fd, temporary = tempfile.mkstemp(prefix=".hermes-platforms-", dir=state)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(data, out, ensure_ascii=False, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+    effective = (set(DEFAULT_UNATTENDED_PLATFORMS) - new_attended) | new_unattended
+    return {
+        "attended": sorted(new_attended),
+        "unattended": sorted(new_unattended),
+        "effective_unattended": sorted(effective),
+    }
+
+
+def _session_key(session_id):
+    return hashlib.sha256(session_id.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _touch_turn(sessions, key, info):
+    # Dict order (also preserved by JSON) breaks equal wall-clock ties by last touch.
+    sessions.pop(key, None)
+    sessions[key] = info
+
+
+def _recent_turns(sessions, now):
+    recent = [(sid, info) for sid, info in sessions.items()
+              if 0 <= now - info["at"] <= TURNS_KEEP_SECONDS]
+    recent.sort(key=lambda item: item[1]["at"])
+    return dict(recent[-TURNS_KEEP_MAX:])
+
+
+@contextmanager
+def _turns_lock(state):
+    """Bounded OS lock, like the learning ledger; never unlink the stable lock inode."""
+    state = Path(state)
+    state.mkdir(parents=True, exist_ok=True)
+    path = state / TURNS_LOCK
+    if path.is_symlink():
+        raise OSError("turn lock must not be a symlink")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "r+b") as handle:
+        acquired = False
+        try:
+            deadline = time.monotonic() + TURNS_LOCK_TIMEOUT
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK) or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            yield
+        finally:
+            if acquired:
+                try:
+                    if os.name == "nt":
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError as exc:
+                    # Closing also releases the lock. Do not reapply an already committed delta.
+                    LOGGER.warning("SeroBeyinn V3 Hermes turn lock release failed (%s)", type(exc).__name__)
+
+
+def load_turns(state):
+    """Read hash-keyed records. Missing is empty; damage/refusal must not authorize overwrite.
+
+    Schema 1 was the unmerged PR's raw-key format. Read it only to preserve trial
+    installations' counts; every successful write is schema 2, including temp files.
+    """
+    path = Path(state) / TURNS_FILE
+    if path.is_symlink():
+        raise OSError("turn state must not be a symlink")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if (not isinstance(data, dict) or type(data.get("schema", 1)) is not int
+            or data.get("schema", 1) not in (1, 2) or not isinstance(data.get("sessions"), dict)):
+        raise ValueError("invalid turn state")
+    clean = {}
+    for session_id, info in data["sessions"].items():
+        if not isinstance(session_id, str) or not isinstance(info, dict):
+            continue
+        turns, platform, at = info.get("turns"), info.get("platform"), info.get("at")
+        if isinstance(turns, bool) or not isinstance(turns, int) or turns < 0:
+            continue
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            continue
+        try:
+            if not math.isfinite(at):
+                continue
+        except OverflowError:
+            continue
+        if data.get("schema", 1) == 1:
+            session_id = _session_key(session_id)
+        elif len(session_id) != 64 or any(c not in "0123456789abcdef" for c in session_id):
+            continue
+        clean[session_id] = {"platform": platform if isinstance(platform, str) else None, "turns": turns, "at": at}
+    return _recent_turns(clean, time.time())
+
+
+def save_turns(state, sessions):
+    """Caller holds _turns_lock across read/modify/write; errors retain dirty memory."""
+    data = {"schema": 2, "sessions": _recent_turns(sessions, time.time())}
+    import tempfile
+    temporary = None
+    state = Path(state)
+    if (state / TURNS_FILE).is_symlink():
+        raise OSError("turn state must not be a symlink")
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".hermes-turns-", dir=state)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(data, out, ensure_ascii=False)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, state / TURNS_FILE)
+    finally:
+        if temporary and os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _update_turns(state, sessions, session_id, platform=None, first=False, finalize=False):
+    """Commit one delta, or keep a bounded local delta if persistence is unavailable.
+
+    Only uncommitted increments are added to a fresh disk snapshot on recovery: a
+    max(memory, disk) merge loses counts when another writer advanced meanwhile.
+    Healthy cached records never resurrect a session another process finalized.
+    """
+    now = time.time()
+    recent = _recent_turns(sessions, now)
+    sessions.clear()
+    sessions.update(recent)
+    key = _session_key(session_id)
+    local = sessions.get(key)
+    pending = (local or {}).get("pending", 0)
+    reset_at = (local or {}).get("reset_at")
+    candidate = None
+    committed = False
+
+    def change(stored, readable=True):
+        # A failed finalize suppresses only the old row, not another writer's
+        # later new session. Keep this boundary until its deletion/reset commits.
+        reopened = stored and reset_at is not None and stored["at"] > reset_at
+        if stored and reset_at is not None and not reopened:
+            stored = None
+        info = dict(stored or {"platform": None, "turns": 0})
+        if not readable and local and not local.get("closed"):
+            info = dict(local)
+        else:
+            info["turns"] += pending
+        if (local and local.get("platform") is not None and not reopened
+                and (pending or (finalize and info["platform"] is None))):
+            info["platform"] = local["platform"]
+        if not finalize:
+            if (first or info["platform"] is None) and isinstance(platform, str):
+                info["platform"] = platform
+            info["turns"] += 1
+        return {"platform": info["platform"], "turns": info["turns"], "at": time.time()}
+
+    try:
+        with _turns_lock(state):
+            stored = load_turns(state)
+            candidate = change(stored.get(key))
+            if finalize:
+                stored.pop(key, None)
+            else:
+                _touch_turn(stored, key, candidate)
+            save_turns(state, stored)
+        committed = True
+        pending = 0
+    except (OSError, ValueError, RecursionError) as exc:
+        LOGGER.warning("SeroBeyinn V3 Hermes turn state unavailable (%s); using process memory", type(exc).__name__)
+        if candidate is None:
+            # A lock refusal may still allow a committed, atomically written snapshot
+            # to seed memory. Never write it back without successfully taking the lock.
+            try:
+                candidate = change(load_turns(state).get(key))
+            except (OSError, ValueError, RecursionError):
+                candidate = change(None, readable=False)
+        pending = 0 if finalize else pending + 1
+    if committed and finalize:
+        sessions.pop(key, None)
+    else:
+        cached = dict(candidate, pending=pending, closed=finalize)
+        if not committed and (finalize or reset_at is not None):
+            cached["reset_at"] = candidate["at"] if finalize else reset_at
+        _touch_turn(sessions, key, cached)
+    recent = _recent_turns(sessions, time.time())
+    sessions.clear()
+    sessions.update(recent)
+    return candidate
+
+
+def _runtime(vault):
+    """Resolve the state directory from the vault's installer-written runtime file."""
+    runtime = Path(vault) / ".serobeyinn-runtime.json"
+    # A file that does not parse names itself (#587); the exception type, which register()
+    # logs, is kept.
+    try:
+        data = json.loads(runtime.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise json.JSONDecodeError(runtime.name + " is not valid JSON: " + exc.msg, exc.doc, exc.pos) from None
+    except UnicodeDecodeError as exc:
+        raise UnicodeDecodeError(exc.encoding, exc.object, exc.start, exc.end,
+                                 exc.reason + " (" + runtime.name + " is not UTF-8)") from None
+    if not isinstance(data, dict) or not isinstance(data.get("state"), str) or not data["state"]:
+        raise ValueError("runtime state missing")
+    state = Path(data["state"]).expanduser()
+    if not state.is_absolute():
+        raise ValueError("runtime state must be absolute")
+    return state
+
+
+def hook_command(vault, state, python=None):
+    hook = Path(vault) / ".claude/scripts/serobeyinn_v3_hook.py"
+    return [python or sys.executable, str(hook), "--vault", str(vault), "--state", str(state), "--harness", "hermes"]
+
+
+def run_hook(vault, state, payload, python=None, timeout=HOOK_TIMEOUT):
+    """Run one lifecycle event through the shared adapter; return injected text or ''."""
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
+    try:
+        completed = subprocess.run(hook_command(vault, state, python), input=json.dumps(payload, ensure_ascii=False),
+                                   capture_output=True, text=True, encoding="utf-8", timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOGGER.warning("SeroBeyinn V3 adapter transport failed (%s)", type(exc).__name__)
+        return ""
+    if completed.returncode:
+        LOGGER.warning("SeroBeyinn V3 adapter exited with status %s", completed.returncode)
+        return ""
+    try:
+        output = json.loads(completed.stdout or "{}")
+    except ValueError:
+        LOGGER.warning("SeroBeyinn V3 adapter returned invalid JSON")
+        return ""
+    specific = output.get("hookSpecificOutput") if isinstance(output, dict) else None
+    text = specific.get("additionalContext") if isinstance(specific, dict) else None
+    return text if isinstance(text, str) else ""
+
+
+def make_hooks(vault, state=None, python=None, session_cwd=None):
+    """Build the Hermes hook callables. Pure function so tests can drive them without Hermes."""
+    vault = Path(vault).expanduser().resolve()
+    state = Path(state).expanduser().resolve() if state else _runtime(vault)
+    # Hash-keyed, bounded cache of acknowledged counts and uncommitted deltas.
+    sessions = {}
+    # Kept separate from turn state so filesystem paths never go to disk.
+    session_cwds = {}
+    sessions_lock = threading.Lock()
+
+    def cwd_payload(kw, platform):
+        # Explicit values, including invalid ones, belong to the bridge validator.
+        # Never replace a refused/remote workspace with the gateway launch directory.
+        if "cwd" in kw:
+            return {"cwd": kw["cwd"] if kw["cwd"] is not None else ""}
+        if callable(session_cwd):
+            try:
+                cwd = session_cwd()
+            except Exception:
+                LOGGER.warning("SeroBeyinn V3 session cwd unavailable")
+                return {"cwd": ""}
+            if cwd:
+                return {"cwd": cwd}
+        configured, _ = read_platforms(state, vault)
+        gateways = GATEWAY_PLATFORMS | set(configured["attended"]) | set(configured["unattended"])
+        if platform in gateways and platform not in LOCAL_PLATFORMS:
+            return {"cwd": str(vault)}
+        return {}
+
+    def before(**kw):
+        nonlocal session_cwds
+        session_id = kw.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        first = bool(kw.get("is_first_turn"))
+        with sessions_lock:
+            info = _update_turns(state, sessions, session_id, kw.get("platform"), first)
+            turns = info["turns"]
+            platform = info["platform"]
+            selected_cwd = cwd_payload(kw, platform)
+            # An absent cwd leaves the finalize cache intact, but an explicit invalid
+            # cwd or a refused context replaces it so finalize cannot reuse stale data.
+            if selected_cwd:
+                _touch_turn(session_cwds, _session_key(session_id), {"at": time.time(), "payload": selected_cwd})
+                session_cwds = _recent_turns(session_cwds, time.time())
+        event = "SessionStart" if first else "UserPromptSubmit"
+        prompt = kw.get("user_message") if isinstance(kw.get("user_message"), str) else ""
+        payload = {"hook_event_name": event, "session_id": session_id, "prompt": prompt}
+        payload.update(selected_cwd)
+        text = run_hook(vault, state, payload, python)
+        parts = [text] if text else []
+        unattended = resolve_unattended_platforms(vault, state)
+        if turns % REMINDER_EVERY == 0 and platform not in unattended:
+            parts.append(REMINDER.format(n=turns))
+        return {"context": "\n\n".join(parts)} if parts else None
+
+    def finalize(**kw):
+        session_id = kw.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        with sessions_lock:
+            info = _update_turns(state, sessions, session_id, finalize=True)
+            cached_cwd = session_cwds.pop(_session_key(session_id), None)
+        unattended = resolve_unattended_platforms(vault, state)
+        if info and info["platform"] in unattended:
+            return None
+        payload = {"hook_event_name": "SessionEnd", "session_id": session_id}
+        if "cwd" in kw:
+            payload.update(cwd_payload(kw, None))
+        elif cached_cwd and 0 <= time.time() - cached_cwd["at"] <= TURNS_KEEP_SECONDS:
+            payload.update(cached_cwd["payload"])
+        run_hook(vault, state, payload, python)
+        return None
+
+    return {"pre_llm_call": before, "on_session_finalize": finalize}
+
+
+def register(ctx, vault=None, state=None):
+    """Hermes entry point. ``vault`` defaults to ``SEROBEYINN_VAULT`` so one plugin serves any vault."""
+    vault = vault or os.environ.get("SEROBEYINN_VAULT")
+    if not vault or not (Path(vault) / ".serobeyinn-runtime.json").is_file():
+        return  # An unmounted or uninstalled vault must leave Hermes fully usable.
+    try:
+        # Older Hermes releases expose register_hook only. Resolve the optional API
+        # inside each turn, not at registration (the gateway serves many sessions).
+        cwd_reader = getattr(ctx, "session_cwd", None)
+        hooks = make_hooks(vault, state, session_cwd=(lambda: ctx.session_cwd()) if callable(cwd_reader) else None)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        # Fail open: a damaged runtime file disables this plugin, never Hermes. The
+        # class is enough to diagnose; the file contents stay out of the log.
+        LOGGER.warning("SeroBeyinn V3 runtime unavailable (%s); memory hooks not registered", type(exc).__name__)
+        return
+    for name, hook in hooks.items():
+        ctx.register_hook(name, hook)
+
+
+def plan_plugin(vault, state):
+    """Files the installer drops into the vault for the user to link into ``~/.hermes/plugins``.
+
+    The vault copy is the source of truth; ``hermes-plugin/__init__.py`` only pins the
+    vault path for this machine, like ``.serobeyinn-runtime.json`` does for the CLI.
+    """
+    vault = Path(vault).resolve()
+    init = (
+        '"""Hermes plugin shim for SeroBeyinn V3; the implementation lives in the vault."""\n'
+        "import importlib.util, os\n"
+        "from pathlib import Path\n\n"
+        f"VAULT = Path(os.environ.get('SEROBEYINN_VAULT') or {str(vault)!r})\n\n\n"
+        "def register(ctx):\n"
+        "    module_path = VAULT / '.claude/scripts/serobeyinn_v3_hermes.py'\n"
+        "    if not module_path.is_file():\n"
+        "        return\n"
+        "    spec = importlib.util.spec_from_file_location('serobeyinn_v3_hermes', module_path)\n"
+        "    module = importlib.util.module_from_spec(spec)\n"
+        "    spec.loader.exec_module(module)\n"
+        "    module.register(ctx, vault=VAULT)\n"
+    )
+    manifest = (
+        f"name: {PLUGIN_NAME}\n"
+        "version: 1.0.0\n"
+        "description: SeroBeyinn V3 source-backed memory for Hermes (context on every turn, SessionEnd receipt tracking).\n"
+        "provides_hooks:\n"
+        "  - pre_llm_call\n"
+        "  - on_session_finalize\n"
+    )
+    return {".claude/hermes-plugin/__init__.py": init.encode(), ".claude/hermes-plugin/plugin.yaml": manifest.encode()}

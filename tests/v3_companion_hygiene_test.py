@@ -1,0 +1,1254 @@
+"""Companion hygiene (#96): measurable limits, a SessionStart notice, doctor, lossless compaction.
+
+Synthetic data only. The two oversized fixtures mirror the shapes reported in #96:
+newest-first dated paragraphs above a never-pruned Previous section (Last-Session.md)
+and many dated updates per thread plus a closed section (Threads.md).
+"""
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+import errno
+import hashlib
+import json
+import multiprocessing as mp
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+import unicodedata
+from unittest import mock
+
+from v3_package_helpers import inherited_env
+
+ROOT = Path(os.environ.get('SEROBEYINN_TEST_REPO', Path(__file__).resolve().parents[1]))
+SCRIPTS = ROOT / 'template/.claude/scripts'
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+import serobeyinn_v3_compact as compact_module  # noqa: E402
+import serobeyinn_v3_companion as companion_module  # noqa: E402
+
+COMPANION = '🔮 850-Companion'
+NOW = datetime(2026, 9, 25, 4, 30, tzinfo=timezone.utc)
+FILLER = 'Karar gerekçesi, kaynak bağlantısı ve açık kalan adım burada ayrıntılı olarak anlatılıyor. '
+RACE_OLD = 'OLD_CARD_CONTENT_MUST_REMAIN_RECOVERABLE'
+RACE_READY = float(os.environ.get('SEROBEYINN_TEST_READY_TIMEOUT', '20'))
+RACE_PROBE = float(os.environ.get('SEROBEYINN_TEST_BLOCK_PROBE_SECONDS', '3'))
+RACE_JOIN = float(os.environ.get('SEROBEYINN_TEST_JOIN_TIMEOUT', '25'))
+
+
+def isolated_temp(state):
+    root = Path(str(state) + '-tmp')
+    root.mkdir(exist_ok=True)
+    tempfile.tempdir = str(root)
+
+
+def stop_process(process):
+    if process.is_alive():
+        process.terminate()
+    process.join(RACE_JOIN)
+
+
+def tree_snapshot(root):
+    return {str(p.relative_to(root)): (p.stat().st_mode, p.stat().st_mtime_ns,
+                                     hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None)
+            for p in [root, *sorted(root.rglob('*'))]}
+
+
+def compact_race_slow(vault, state, ready, resume, out):
+    """Pause after the pre-write checks while retaining the production lock."""
+    isolated_temp(state)
+    original_write = compact_module._write
+    paused = False
+
+    def write(path, content):
+        nonlocal paused
+        if Path(path).parent.name == 'Arşiv' and not paused:
+            paused = True
+            ready.set()
+            if not resume.wait(RACE_READY + RACE_JOIN):
+                raise TimeoutError('slow compaction was not released')
+        original_write(path, content)
+
+    compact_module._write = write
+    out.put(('slow', compact_module.compact(vault, state, now=NOW)))
+
+
+def compact_race_fast(vault, state, done, out):
+    isolated_temp(state)
+    try:
+        out.put(('fast', compact_module.compact(vault, state, now=NOW)))
+    finally:
+        done.set()
+
+
+def acquire_compact_lock_and_exit(target, ready):
+    with compact_module._compact_lock(target):
+        ready.set()
+        os._exit(17)
+
+
+
+def human_entry():
+    """The installed CLI's human formatter (scripts/serobeyinn_entry.py), loaded once."""
+    if not hasattr(human_entry, 'module'):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('hygiene_entry_cli', ROOT / 'scripts/serobeyinn_entry.py')
+        human_entry.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(human_entry.module)
+    return human_entry.module
+
+def oversized_last_session(entries=80):
+    moment = datetime(2026, 9, 24, 21, 10)
+    parts = ['# Son oturum\n\n']
+    for index in range(entries):
+        stamp = (moment - timedelta(hours=3 * index)).strftime('%Y-%m-%d %H:%M')
+        parts.append(f'**{stamp} (Codex)**: ENTRY_{index:03d} ' + FILLER * 11 + '\n\n')
+    parts.append('## Previous Sessions\n')
+    parts.extend(f'### Session: 2026-08-{day:02d}\nPREVIOUS_{day:02d} ' + FILLER * 3 + '\n\n' for day in range(1, 29))
+    return ''.join(parts)
+
+
+def oversized_threads(count=15, updates=16):
+    parts = ['# Threads\n\nBirden fazla oturuma yayılan konular.\n\n## Active Threads\n']
+    for thread in range(count):
+        parts.append(f'### Thread: Konu {thread:02d}\n**Status:** 🟢 Active, 2026-08-01\n**Sahip:** Derya\n')
+        for update in range(updates):
+            day = datetime(2026, 9, 24) - timedelta(days=update)
+            parts.append(f'{day:%Y-%m-%d}: THREAD_{thread:02d}_UPDATE_{update:02d} ' + FILLER * 2 + '\n')
+        parts.append('\n')
+    parts.append('## Closed Threads\n')
+    parts.extend(f'### Thread: Eski {index}\nCLOSED_{index} ' + FILLER + '\n' for index in range(12))
+    return ''.join(parts)
+
+
+class HygieneCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='companion-hygiene-')
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.vault = self.base / 'Örnek SeroBeyinn'
+        self.directory = self.vault / COMPANION
+        self.directory.mkdir(parents=True)
+        self.state = self.base / 'state'
+        self.env = inherited_env(SEROBEYINN_V3_NO_SPAWN='1', PYTHONDONTWRITEBYTECODE='1', PYTHONIOENCODING='utf-8')
+        self.write('Core.md', '# Kimlik\nIDENTITY_CANARY: düşünme ortağı.\n')
+        self.write('Journal.md', '# Journal\n## 2026-09-20\nJOURNAL_CANARY\n' + ('## 2026-08-01\neski gözlem\n' * 900))
+
+    def write(self, name, text):
+        path = self.directory / name
+        path.write_bytes(text.encode('utf-8'))
+        return path
+
+    def run_cli(self, *args, payload=None, script='scripts/serobeyinn_v3.py', ok=True):
+        prefix = [] if script != 'scripts/serobeyinn_v3.py' else ['--vault', self.vault, '--state', self.state]
+        result = subprocess.run([sys.executable, str(ROOT / script), *map(str, prefix + list(args))],
+                                input=json.dumps(payload) if payload is not None else None,
+                                capture_output=True, text=True, encoding='utf-8', env=self.env,
+                                cwd=self.vault, timeout=60)
+        if ok:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        return json.loads(result.stderr)
+
+    def hook(self, event='SessionStart', **kwargs):
+        payload = dict(hook_event_name=event, session_id='synthetic-hygiene', event_id=event + str(kwargs), **kwargs)
+        output = self.run_cli('--vault', self.vault, '--state', self.state, '--harness', 'codex',
+                              payload=payload, script='template/.claude/scripts/serobeyinn_v3_hook.py')
+        return output.get('hookSpecificOutput', {}).get('additionalContext', '')
+
+    def oversized(self):
+        last = self.write('Last-Session.md', oversized_last_session())
+        threads = self.write('Threads.md', oversized_threads())
+        self.run_cli('sync')
+        return last, threads
+
+    def test_oversized_handoff_files_get_one_notice_inside_every_budget(self):
+        last, threads = self.oversized()
+        sizes = len(last.read_text(encoding='utf-8')), len(threads.read_text(encoding='utf-8'))
+        self.assertGreater(sizes[0], 90000)
+        self.assertGreater(sizes[1], 50000)
+        text = self.hook()
+        self.assertTrue(text.startswith(f'Memory hygiene: Last-Session.md is {sizes[0]} chars (limit 3000); '
+                                        f'Threads.md is {sizes[1]} chars (limit 8000).'), text[:300])
+        self.assertEqual(text.count('Memory hygiene'), 1)
+        self.assertIn('companion-compact', text)
+        self.assertIn('ENTRY_000', text)
+        self.assertLessEqual(len(text), 5000)
+        (self.vault / '.serobeyinn-preferences.json').write_text(json.dumps({'context_chars': 1000, 'context_mode': 'session'}))
+        small = self.hook()
+        self.assertTrue(small.startswith('Memory hygiene: '))
+        self.assertLessEqual(len(small), 1000)
+
+    def test_limit_counts_characters_not_bytes_or_utf16_units(self):
+        body = '# Son oturum\n' + 'ş🔮' * 1493
+        self.assertEqual(len(body), 2999)
+        self.assertGreater(len(body.encode('utf-8')), 3000)
+        self.assertGreater(len(body.encode('utf-16-le')) // 2, 3000)
+        path = self.write('Last-Session.md', body + 'x')
+        self.write('Threads.md', '# Threads\n## Active Threads\n### Thread: A\n**Status:** active\n')
+        self.run_cli('sync')
+        self.assertNotIn('Memory hygiene', self.hook())
+        # One more entry on a file sitting at the limit is caught at the next session start.
+        path.write_bytes((body + 'x\n2026-09-25: yeni kayıt\n').encode('utf-8'))
+        self.assertIn('Memory hygiene: Last-Session.md is 3024 chars (limit 3000).', self.hook())
+        self.assertNotIn('Threads.md is', self.hook())
+
+    def test_post_tool_use_reports_the_handoff_limit_at_write_time(self):
+        # #707: the agent that wrote the card sees the limit now, not at the next session start.
+        path = self.write('Last-Session.md', '# Son oturum\n' + 'x' * 3100)
+        threads = self.write('Threads.md', '# Threads\n## Active Threads\n### Thread: A\n**Status:** active\n')
+        self.run_cli('sync')
+        text = self.hook('PostToolUse', tool_name='Edit', tool_input={'file_path': str(path)})
+        self.assertTrue(text.startswith('Memory hygiene: Last-Session.md is 3113 chars (limit 3000).'), text[:300])
+        self.assertIn('companion-compact', text)
+        self.assertNotIn('Threads.md is', text)
+        # A note elsewhere, a companion file without a limit and a file within its limit stay silent.
+        other = self.vault / 'not.md'
+        other.write_text('# not\n', encoding='utf-8')
+        for target in (other, self.directory / 'Journal.md', threads):
+            self.assertNotIn('Memory hygiene', self.hook('PostToolUse', tool_name='Edit',
+                                                         tool_input={'file_path': str(target)}))
+        # A same-named file outside the companion directory is not the handoff file.
+        project = self.vault / 'projects' / 'ornek'
+        project.mkdir(parents=True)
+        (project / 'Last-Session.md').write_text('x' * 3500, encoding='utf-8')
+        self.assertNotIn('Memory hygiene', self.hook('PostToolUse', tool_name='Edit',
+                                                     tool_input={'file_path': str(project / 'Last-Session.md')}))
+
+    def test_codex_apply_patch_reports_the_handoff_limit_at_write_time(self):
+        # Codex sends apply_patch as tool_input.command; the header path is relative to cwd.
+        path = self.write('Last-Session.md', '# Son oturum\n' + 'x' * 3100)
+        self.run_cli('sync')
+        relative = path.relative_to(self.vault).as_posix()
+
+        def patch(*headers):
+            body = ''.join('*** %s\n@@\n-x\n+x\n' % header for header in headers)
+            return {'command': '*** Begin Patch\n' + body + '*** End Patch\n'}
+
+        text = self.hook('PostToolUse', tool_name='apply_patch', cwd=str(self.vault),
+                         tool_input=patch('Update File: ' + relative))
+        self.assertTrue(text.startswith('Memory hygiene: Last-Session.md is 3113 chars (limit 3000).'), text[:300])
+        # The companion file found among several headers of one patch still reports.
+        self.assertIn('Memory hygiene', self.hook('PostToolUse', tool_name='apply_patch', cwd=str(self.vault),
+                                                  tool_input=patch('Add File: not.md', 'Update File: ' + relative)))
+        # Without an absolute cwd a relative header cannot be resolved, so nothing is reported.
+        self.assertNotIn('Memory hygiene', self.hook('PostToolUse', tool_name='apply_patch',
+                                                     tool_input=patch('Update File: ' + relative)))
+        # A deleted companion file is not measured.
+        self.assertNotIn('Memory hygiene', self.hook('PostToolUse', tool_name='apply_patch', cwd=str(self.vault),
+                                                     tool_input=patch('Delete File: ' + relative)))
+
+    def test_post_tool_use_limit_notice_is_harness_gated(self):
+        path = self.write('Last-Session.md', '# Son oturum\n' + 'x' * 3100)
+        payload = {'hook_event_name': 'PostToolUse', 'tool_input': {'file_path': str(path)}}
+        self.state.mkdir(parents=True, exist_ok=True)
+        for harness in ('claude', 'codex', 'pi'):
+            self.assertIn('Memory hygiene', companion_module.hook_limit_notice(self.vault, self.state, payload, harness))
+        for harness in ('antigravity', 'opencode', 'omp', 'hermes'):
+            self.assertEqual(companion_module.hook_limit_notice(self.vault, self.state, payload, harness), '')
+        self.assertEqual(companion_module.hook_limit_notice(
+            self.vault, self.state, dict(payload, hook_event_name='Stop'), 'claude'), '')
+
+    def test_parallel_last_session_notice_preserves_other_cards_and_offers_limit(self):
+        path = self.write('Last-Session.md', '# Son oturum\n' + 'x' * 3958)
+        self.run_cli('sync')
+        self.run_cli('preferences', '--parallel-sessions', 'on')
+        before = path.read_bytes()
+        text = self.hook()
+        self.assertIn('preferences --last-session-chars 4000', text)
+        self.assertIn("Do not compact other sessions' fresh cards", text)
+        self.assertNotIn('Before other memory writes run:', text)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.run_cli('preferences')['companion_limits']['Last-Session.md'], 3000)
+        self.run_cli('preferences', '--parallel-sessions', 'off')
+        self.assertIn('Before other memory writes run:', self.hook())
+        self.assertNotIn('--last-session-chars', self.hook())
+
+    def test_parallel_notice_bounds_and_threads_only_keep_existing_guidance(self):
+        report = {'over_limit': ['Last-Session.md'], 'files': {
+            'Last-Session.md': {'chars': 200001, 'limit': 3000}}}
+        text = companion_module.hygiene_notice(report, parallel=True)
+        self.assertIn('exceeds the supported limit', text)
+        self.assertNotIn('--last-session-chars', text)
+        report = {'over_limit': ['Threads.md'], 'files': {
+            'Threads.md': {'chars': 9000, 'limit': 8000}}}
+        text = companion_module.hygiene_notice(report, parallel=True)
+        self.assertIn('Before other memory writes run:', text)
+        self.assertNotIn('--last-session-chars', text)
+        self.assertEqual(companion_module.hygiene_notice({'over_limit': []}, parallel=True), '')
+
+    def test_invalid_parallel_settings_do_not_change_notice(self):
+        self.write('Last-Session.md', 'x' * 4001)
+        self.run_cli('sync')
+        (self.state / 'parallel-sessions.json').write_text('{broken', encoding='utf-8')
+        text = self.hook()
+        self.assertIn('Before other memory writes run:', text)
+        self.assertNotIn('--last-session-chars', text)
+
+    def test_limits_are_configurable_machine_local_and_validated_before_saving(self):
+        self.oversized()
+        saved = self.run_cli('preferences', '--last-session-chars', '0', '--threads-chars', '200000')
+        self.assertEqual(saved['status'], 'saved')
+        self.assertEqual(saved['companion_limits'], {'Last-Session.md': 0, 'Threads.md': 200000})
+        self.assertFalse((self.vault / '.serobeyinn-preferences.json').exists(), 'vault preference schema must not change')
+        stored = json.loads((self.state / 'companion-limits.json').read_text(encoding='utf-8'))
+        self.assertEqual(stored, {'schema': 1, 'Last-Session.md': 0, 'Threads.md': 200000})
+        self.assertNotIn('Memory hygiene', self.hook())
+        error = self.run_cli('preferences', '--context-chars', '3000', '--threads-chars', '999', ok=False)
+        self.assertIn('Threads.md limit', error['message'])
+        self.assertFalse((self.vault / '.serobeyinn-preferences.json').exists(), 'a rejected limit must not save other fields')
+        self.run_cli('preferences', '--profile', 'economical')
+        self.assertEqual(self.run_cli('preferences')['companion_limits'], {'Last-Session.md': 0, 'Threads.md': 200000})
+        (self.state / 'companion-limits.json').write_text('{broken', encoding='utf-8')
+        self.assertIn('Memory hygiene', self.hook(), 'a damaged limits file falls back to the defaults')
+        before = (self.vault / '.serobeyinn-preferences.json').read_bytes()
+        self.run_cli('preferences', '--context-chars', '4000', '--threads-chars', '9000', ok=False)
+        self.assertEqual((self.state / 'companion-limits.json').read_text(encoding='utf-8'), '{broken')
+        self.assertEqual((self.vault / '.serobeyinn-preferences.json').read_bytes(), before, 'nothing saved on a damaged limits file')
+
+    def test_doctor_reports_sizes_as_hygiene_not_as_a_sync_failure(self):
+        self.oversized()
+        doctor = self.run_cli('doctor')
+        hygiene = doctor['companion_hygiene']
+        self.assertEqual(hygiene['status'], 'over_limit')
+        self.assertEqual(hygiene['over_limit'], ['Last-Session.md', 'Threads.md'])
+        self.assertEqual(hygiene['files']['Last-Session.md']['limit'], 3000)
+        self.assertTrue(hygiene['files']['Threads.md']['over_limit'])
+        self.assertNotIn('limit', hygiene['files']['Journal.md'], 'the Journal accumulates by design')
+        self.assertGreater(hygiene['files']['Journal.md']['chars'], 8000)
+        self.assertNotEqual(doctor['status'], 'needs_attention')
+
+    def test_compaction_is_lossless_fits_the_limits_and_clears_the_notice(self):
+        last, threads = self.oversized()
+        originals = {path.name: path.read_text(encoding='utf-8') for path in (last, threads)}
+        journal = (self.directory / 'Journal.md').read_bytes()
+        plan = self.run_cli('companion-compact', '--dry-run')
+        self.assertEqual(plan['status'], 'dry_run')
+        self.assertEqual({name: path.read_text(encoding='utf-8') for name, path in
+                          (('Last-Session.md', last), ('Threads.md', threads))}, originals)
+        self.assertFalse((self.directory / 'Arşiv').exists())
+        result = self.run_cli('companion-compact')
+        self.assertEqual(result['status'], 'compacted')
+        self.assertEqual(result['deleted_chars'], 0)
+        self.assertFalse(result['model_calls'])
+        self.assertEqual(result['sync']['status'], 'succeeded')
+        self.assertEqual((self.directory / 'Journal.md').read_bytes(), journal)
+        month = datetime.now(timezone.utc).strftime('%Y-%m')
+        for path, limit in ((last, 3000), (threads, 8000)):
+            live = path.read_text(encoding='utf-8')
+            archive = self.directory / 'Arşiv' / f'{path.stem}-{month}.md'
+            stored = archive.read_text(encoding='utf-8')
+            self.assertLessEqual(len(live), limit)
+            self.assertEqual(result['files'][path.name]['chars_after'], len(live))
+            self.assertTrue(stored.startswith('---\n{"kind": "note", "visibility": "private"'))
+            self.assertEqual(live.count(f'Arşivlenen metin: `{COMPANION}/Arşiv/{archive.name}`'), 1)
+            # Every original line is still somewhere, as often as it was: nothing dropped.
+            missing = Counter(originals[path.name].splitlines()) - (Counter(live.splitlines()) + Counter(stored.splitlines()))
+            self.assertEqual(missing, Counter())
+        live = last.read_text(encoding='utf-8')
+        self.assertIn('ENTRY_000', live)
+        self.assertNotIn('PREVIOUS_01', live)
+        self.assertNotIn('ENTRY_059', live)
+        live = threads.read_text(encoding='utf-8')
+        for thread in range(15):
+            self.assertIn(f'### Thread: Konu {thread:02d}\n**Status:** 🟢 Active, 2026-08-01\n**Sahip:** Derya\n'
+                          f'2026-09-24: THREAD_{thread:02d}_UPDATE_00', live)
+        self.assertNotIn('CLOSED_0', live)
+        text = self.hook()
+        self.assertNotIn('Memory hygiene', text)
+        self.assertIn('ENTRY_000', text)
+        for canary in ('ENTRY_059', 'PREVIOUS_01', 'CLOSED_0', 'UPDATE_15'):
+            self.assertNotIn(canary, text)
+        found = self.run_cli('context', 'PREVIOUS_01 ENTRY_059 CLOSED_3')
+        self.assertFalse([r for r in found['records'] if '/Arşiv/' in r['source']], 'archives are private')
+        self.assertEqual(self.run_cli('doctor')['companion_hygiene']['status'], 'ok')
+        again = self.run_cli('companion-compact')
+        self.assertEqual(again['status'], 'within_limit')
+
+    def test_a_second_compaction_appends_to_the_month_archive_with_one_pointer(self):
+        last = self.write('Last-Session.md', oversized_last_session(8))
+        first = self.run_cli('companion-compact')
+        self.assertEqual(first['files']['Last-Session.md']['status'], 'compacted')
+        archive = self.directory / first['files']['Last-Session.md']['archive'].split('/', 1)[1]
+        before = archive.read_text(encoding='utf-8')
+        newer = ''.join(f'**2026-09-25 0{hour}:00 (Claude)**: NEWER_{hour} ' + FILLER * 11 + '\n\n' for hour in range(1, 5))
+        text = last.read_text(encoding='utf-8')
+        last.write_text(text.replace('# Son oturum\n\n', '# Son oturum\n\n' + newer, 1), encoding='utf-8')
+        second = self.run_cli('companion-compact')
+        self.assertEqual(second['files']['Last-Session.md']['status'], 'compacted')
+        after = archive.read_text(encoding='utf-8')
+        self.assertTrue(after.startswith(before))
+        self.assertEqual(after.count('---\n{"kind"'), 1)
+        live = last.read_text(encoding='utf-8')
+        self.assertIn('NEWER_4', live)
+        self.assertEqual(live.count('Arşivlenen metin:'), 1)
+        self.assertIn('NEWER_1', after)
+
+    def test_undated_prose_over_the_limit_is_reported_not_cut(self):
+        path = self.write('Last-Session.md', '# Son oturum\n\n' + FILLER * 60)
+        before = path.read_bytes()
+        result = self.run_cli('companion-compact')
+        self.assertEqual(result['status'], 'needs_rewrite')
+        self.assertEqual(result['files']['Last-Session.md']['status'], 'needs_rewrite')
+        self.assertEqual(path.read_bytes(), before)
+        # Issue #168: full file is backed up verbatim to Arşiv before rewriting
+        archive = self.directory / 'Arşiv' / f'Last-Session-{datetime.now(timezone.utc).strftime("%Y-%m")}.md'
+        self.assertTrue(archive.exists())
+        archive_text = archive.read_text(encoding='utf-8')
+        self.assertIn(FILLER, archive_text)
+        self.assertIn('tam metin yedeği (needs_rewrite)', archive_text)
+        self.assertEqual(result['files']['Last-Session.md'].get('archive'),
+                         f'{COMPANION}/Arşiv/{archive.name}')
+        self.assertEqual(result['files']['Last-Session.md']['backup'], 'written')
+        self.assertIn(before.decode('utf-8'), archive_text)
+
+    def test_dry_run_undated_prose_does_not_create_archive(self):
+        path = self.write('Last-Session.md', '# Son oturum\n\n' + FILLER * 60)
+        before = path.read_bytes()
+        result = self.run_cli('companion-compact', '--dry-run')
+        self.assertEqual(result['status'], 'dry_run')
+        self.assertEqual(result['files']['Last-Session.md']['status'], 'needs_rewrite')
+        self.assertEqual(result['files']['Last-Session.md']['backup'], 'planned')
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse((self.directory / 'Arşiv').exists())
+        self.assertFalse((self.directory / compact_module.LOCK_NAME).exists())
+        # The human dry-run line must not claim a backup that was never written.
+        human = human_entry().human_result(result, 'companion-compact')
+        self.assertNotIn('yedeklendi', human)
+        self.assertIn('--dry-run olmadan calistir', human)
+
+    def test_needs_rewrite_avoids_duplicate_snapshots_on_repeated_runs(self):
+        body = '# Threads\n\n## Active Threads\n' + ('### Thread\nAktif konu detay metni.\n' * 300)
+        path = self.write('Threads.md', body)
+        first = self.run_cli('companion-compact')
+        self.assertEqual(first['files']['Threads.md']['status'], 'needs_rewrite')
+        archive = self.directory / 'Arşiv' / f'Threads-{datetime.now(timezone.utc).strftime("%Y-%m")}.md'
+        self.assertTrue(archive.exists())
+        first_size = len(archive.read_text(encoding='utf-8'))
+        # Second run without changes should not duplicate the snapshot
+        second = self.run_cli('companion-compact')
+        self.assertEqual(second['files']['Threads.md']['status'], 'needs_rewrite')
+        second_size = len(archive.read_text(encoding='utf-8'))
+        self.assertEqual(first_size, second_size)
+        self.assertEqual(second['files']['Threads.md']['backup'], 'exists')
+
+    def test_a_file_still_over_the_limit_after_moving_is_backed_up_whole(self):
+        # #168 with a few dated updates: they move, the file stays over the limit and the agent
+        # rewrites it next, so the remaining text must reach the archive verbatim first.
+        parts = ['# Threads\n\n## Active Threads\n']
+        for thread in range(13):
+            parts.append(f'### Thread: Konu {thread:02d}\n**Status:** 🟢 Active: created 2026-09-01\n'
+                         f'Durum [[Karar-{thread:02d}]] OPEN_{thread:02d} ' + FILLER * 8 + '\n')
+            if thread < 2:
+                parts.append(f'2026-09-10: OLD_UPDATE_{thread} ' + FILLER * 2 + '\n2026-09-20: NEW_UPDATE_{thread}\n')
+            parts.append('\n')
+        original = ''.join(parts)
+        self.assertGreater(len(original), 8000)
+        path = self.write('Threads.md', original)
+        first = self.run_cli('companion-compact')
+        entry = first['files']['Threads.md']
+        self.assertEqual((first['status'], entry['status'], entry['within_limit_after'], entry['backup']),
+                         ('needs_rewrite', 'compacted', False, 'written'))
+        live = path.read_text(encoding='utf-8')
+        self.assertNotIn('OLD_UPDATE_0', live)
+        archive = self.directory / 'Arşiv' / f'Threads-{datetime.now(timezone.utc).strftime("%Y-%m")}.md'
+        text = archive.read_text(encoding='utf-8')
+        self.assertIn(live, text)
+        self.assertIn('OLD_UPDATE_0', text)
+        human = human_entry().human_result(first, 'companion-compact')
+        self.assertIn('hala sinirin (8000) ustunde (tam metin arsive yedeklendi: ', human)
+        again = self.run_cli('companion-compact')
+        self.assertEqual((again['files']['Threads.md']['status'], again['files']['Threads.md']['backup']),
+                         ('needs_rewrite', 'exists'))
+        self.assertEqual(archive.read_text(encoding='utf-8'), text)
+        # The agent summarizes; every line of the original is still in the archive.
+        path.write_text('# Threads\n\n## Active Threads\n### Thread: Konu 00\nÖzet.\n', encoding='utf-8')
+        self.assertEqual(self.run_cli('companion-compact')['status'], 'within_limit')
+        text = archive.read_text(encoding='utf-8')
+        for line in original.splitlines():
+            self.assertIn(line, text)
+
+    def test_symlinked_archive_directory_is_refused(self):
+        self.write('Last-Session.md', oversized_last_session(8))
+        outside = self.base / 'outside'; outside.mkdir()
+        try:
+            (self.directory / 'Arşiv').symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks unavailable')
+        before = (self.directory / 'Last-Session.md').read_bytes()
+        error = self.run_cli('companion-compact', ok=False)
+        self.assertIn('symlink', error['message'])
+        self.assertEqual((self.directory / 'Last-Session.md').read_bytes(), before)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_multi_card_parallel_sessions_compacted_losslessly_keeping_newest_card(self):
+        moment = datetime(2026, 9, 26, 16, 30)
+        cards = ['# Son oturum\n\n']
+        for i in range(12):
+            stamp = (moment - timedelta(hours=2 * i)).strftime('%Y-%m-%d %H:%M')
+            cards.append(f'## {stamp} · session_{i:02d} · a{i:07x}\n'
+                         f'CARD_{i:02d}: Oturum kararı ve sonuçları. ' + FILLER * 5 + '\n\n')
+        last = self.write('Last-Session.md', ''.join(cards))
+        self.run_cli('sync')
+        self.assertIn('Memory hygiene: Last-Session.md is', self.hook())
+        result = self.run_cli('companion-compact')
+        self.assertEqual(result['status'], 'compacted')
+        live = last.read_text(encoding='utf-8')
+        self.assertLessEqual(len(live), 3000)
+        self.assertIn('CARD_00', live, 'the newest session card is preserved')
+        self.assertNotIn('CARD_11', live, 'oldest session card is moved to archive')
+        month = datetime.now(timezone.utc).strftime('%Y-%m')
+        archive = (self.directory / 'Arşiv' / f'Last-Session-{month}.md').read_text(encoding='utf-8')
+        self.assertIn('CARD_11', archive, 'oldest session card is safely preserved in archive')
+
+    def test_private_source_decisions_are_not_promoted_to_internal_ledger(self):
+        cards = ['---\n{"visibility":"private"}\n---\n# Son oturum\n\n']
+        cards += [f'## 2026-09-{day:02d}: PRIVATE_CARD_{day}\n**Karar:** PRIVATE_ONLY_{day}\n' + FILLER * 5 + '\n'
+                  for day in range(25, 10, -1)]
+        self.write('Last-Session.md', ''.join(cards))
+        result = self.run_cli('companion-compact')
+        self.assertEqual(result['status'], 'compacted')
+        self.assertFalse((self.directory / 'Kararlar.md').exists())
+        self.assertNotIn('decisions_added', result['files']['Last-Session.md'])
+
+    def test_invalid_existing_decision_ledger_leaves_live_cards_untouched(self):
+        cards = '# Son oturum\n\n' + ''.join(
+            f'## 2026-09-{day:02d}: CARD_{day}\n**Karar:** Decision_{day}\n' + FILLER * 5 + '\n'
+            for day in range(25, 10, -1))
+        last = self.write('Last-Session.md', cards)
+        ledger = self.directory / 'Kararlar.md'
+        ledger.write_bytes(b'\xff')
+        before = last.read_bytes()
+        result = self.run_cli('companion-compact')
+        self.assertEqual(result['status'], 'needs_attention')
+        self.assertEqual(last.read_bytes(), before)
+        self.assertFalse((self.directory / 'Arşiv').exists())
+
+    def test_decisions_keep_the_dated_card_heading_through_equal_subheadings(self):
+        text = ('# Son oturum\n## 2026-09-24 · A\n### Details\n**Karar:** same\n'
+                '## 2026-09-25 · B\n### Details\n**Karar:** same\n')
+        found = compact_module.decisions(text, range(len(compact_module.LINE.findall(text))))
+        self.assertEqual(found, [('## 2026-09-24 · A', '**Karar:** same'),
+                                 ('## 2026-09-25 · B', '**Karar:** same')])
+
+    def test_decision_identity_preserves_equal_lines_from_distinct_cards_and_dedupes_retries(self):
+        line = '  - **Karar:** Aynı söz farklı iki toplantıda söylendi.'
+        first = [('## 2026-09-24 · kart A', line), ('## 2026-09-24 · kart A', line)]
+        archive = f'{COMPANION}/Arşiv/Last-Session-2026-09.md'
+        source = f'{COMPANION}/Last-Session.md'
+        args = (self.directory.resolve(), self.vault.resolve())
+        added = compact_module._record_decisions(*args, first, archive, '\n', source)
+        self.assertEqual(added, 1)
+        ledger = self.directory / 'Kararlar.md'
+        before = ledger.read_bytes()
+        self.assertEqual(compact_module._record_decisions(*args, first, archive.replace('09.md', '10.md'), '\n', source), 0)
+        self.assertEqual(ledger.read_bytes(), before)
+        second = [('## 2026-09-25 · kart B', line)]
+        self.assertEqual(compact_module._record_decisions(*args, second, archive, '\n', source), 1)
+        self.assertEqual(ledger.read_text(encoding='utf-8').count(line), 2)
+        self.assertIn('"remote_allowed": false', ledger.read_text(encoding='utf-8'))
+
+    def test_decision_lines_of_moved_cards_are_copied_to_kararlar_once(self):
+        moment = datetime(2026, 9, 26, 16, 30)
+        cards = ['# Son oturum\n\n']
+        for i in range(12):
+            stamp = (moment - timedelta(hours=2 * i)).strftime('%Y-%m-%d %H:%M')
+            cards.append(f'## {stamp} · session_{i:02d} · a{i:07x}\n'
+                         f'**Karar (Umut):** DECISION_{i:02d} ayrı repo.\n'
+                         f'- **Decision:** EN_{i:02d} kept.\n'
+                         f'**Kararsız:** NOT_{i:02d}\n'
+                         f'```\n**Karar:** FENCED_{i:02d}\n```\n' + FILLER * 5 + '\n\n')
+        last = self.write('Last-Session.md', ''.join(cards))
+        decisions = self.directory / 'Kararlar.md'
+        planned = self.run_cli('companion-compact', '--dry-run')
+        self.assertGreater(planned['files']['Last-Session.md']['decisions_planned'], 0)
+        self.assertFalse(decisions.exists(), 'a dry run writes nothing')
+        result = self.run_cli('companion-compact')
+        self.assertEqual(result['status'], 'compacted')
+        report = result['files']['Last-Session.md']
+        text = decisions.read_text(encoding='utf-8')
+        live = last.read_text(encoding='utf-8')
+        month = datetime.now(timezone.utc).strftime('%Y-%m')
+        archive = (self.directory / 'Arşiv' / f'Last-Session-{month}.md').read_text(encoding='utf-8')
+        moved = [i for i in range(12) if f'DECISION_{i:02d}' in archive]
+        self.assertTrue(moved)
+        self.assertEqual(report['decisions_added'], 2 * len(moved))
+        self.assertIn('DECISION_00', live)
+        self.assertNotIn('DECISION_00', text, 'a card that stays keeps its decision in place only')
+        for i in moved:
+            stamp = (moment - timedelta(hours=2 * i)).strftime('%Y-%m-%d %H:%M')
+            self.assertIn(f'## {stamp} · session_{i:02d} · a{i:07x}\n'
+                          f'Arşiv: `{COMPANION}/Arşiv/Last-Session-{month}.md`\n'
+                          f'**Karar (Umut):** DECISION_{i:02d} ayrı repo.\n'
+                          f'- **Decision:** EN_{i:02d} kept.\n', text)
+        for absent in ('NOT_', 'FENCED_'):
+            self.assertNotIn(absent, text)
+        # A later compaction adds only new decisions; nothing is copied twice.
+        last.write_bytes(live.replace('# Son oturum\n\n', '# Son oturum\n\n' + ''.join(
+            f'## 2026-09-27 {h:02d}:00 · yeni_{h} · b{h:07x}\n**Karar:** NEW_{h}\n' + FILLER * 5 + '\n\n'
+            for h in range(9, 3, -1)), 1).encode('utf-8'))
+        self.run_cli('companion-compact')
+        again = decisions.read_text(encoding='utf-8')
+        self.assertTrue(again.startswith(text), 'Kararlar.md only grows by appending')
+        for i in moved:
+            self.assertEqual(again.count(f'DECISION_{i:02d}'), 1)
+        self.assertIn('DECISION_00', again)
+        # Kararlar.md is an ordinary internal note: sync indexes it like any other source.
+        synced = self.run_cli('sync')
+        self.assertEqual(synced['status'], 'succeeded')
+        self.assertFalse([w for w in synced.get('warnings', []) if 'Kararlar' in str(w)])
+
+    def test_instructions_ask_for_a_rewrite_not_an_append(self):
+        skill = (ROOT / 'template/.agents/skills/serobeyinn/SKILL.md').read_text(encoding='utf-8')
+        installer = (ROOT / 'scripts/install_v3.py').read_text(encoding='utf-8')
+        for text in (skill, installer):
+            text = ' '.join(text.split())
+            self.assertIn('companion-compact', text)
+            self.assertIn('baştan yeniden', text)
+            self.assertIn('her cevapta', text)
+            self.assertIn('kendi kartını', text)
+        # #112: every place that tells an agent how to write Last-Session.md names the same
+        # per-session card heading, so no client falls back to rewriting the whole file.
+        router = (ROOT / 'template/CLAUDE.md').read_text(encoding='utf-8')
+        starter = companion_module.STARTERS['Last-Session.md']
+        heading = '## YYYY-MM-DD HH:MM · <etiket> · <session_id[:8]>'
+        for text in (skill, installer, router, starter):
+            text = ' '.join(text.split())
+            self.assertIn(heading, text)
+            self.assertIn('kartı yazdığın turdaki hook bağlamının `now=`', text)
+            self.assertIn('yerel sistem saatini oku, tahmin etme', text)
+            self.assertIn('kendi kartını', text)
+        for text in (skill, installer, router):
+            text = ' '.join(text.split())
+            self.assertIn('en üste', text)
+            self.assertIn('dosyanın tamamını yeniden yazma', text)
+            self.assertIn('Receipt session', text)
+        for text in (skill, installer, router, starter,
+                     (ROOT / 'template/.agents/skills/serobeyinn-doktor/SKILL.md').read_text(encoding='utf-8')):
+            for forbidden in ('\u2014', '\u2013', '\u00e2'):  # em dash, en dash, circumflex a
+                self.assertNotIn(forbidden, text)
+
+    def test_compaction_refuses_damaged_limits_and_non_utf8_sources(self):
+        last = self.write('Last-Session.md', oversized_last_session(8))
+        before = last.read_bytes()
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / 'companion-limits.json').write_text('{broken', encoding='utf-8')
+        refused = self.run_cli('companion-compact')
+        self.assertEqual((refused['status'], refused['limits_file']), ('needs_attention', 'invalid'))
+        self.assertEqual(last.read_bytes(), before)
+        (self.state / 'companion-limits.json').unlink()
+        last.write_bytes(before + b'\xff\xfe eski kodlama\n')
+        result = self.run_cli('companion-compact')
+        self.assertEqual(result['files']['Last-Session.md']['status'], 'needs_attention')
+        self.assertEqual(last.read_bytes(), before + b'\xff\xfe eski kodlama\n')
+        self.assertFalse((self.directory / 'Arşiv').exists())
+
+
+class HumanOutputTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('hygiene_entry', ROOT / 'scripts/serobeyinn_entry.py')
+        cls.entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.entry)
+
+    def test_doctor_preferences_and_compaction_read_as_short_turkish_lines(self):
+        doctor = self.entry.human_result({'status': 'observed_metadata', 'companion_hygiene': {
+            'over_limit': ['Threads.md'], 'files': {'Threads.md': {'chars': 57012, 'limit': 8000}}}}, 'doctor', '3.3.0')
+        self.assertIn('Hafiza hijyeni: Threads.md 57012 karakter (sinir 8000).', doctor)
+        self.assertIn('serobeyinn.py companion-compact', doctor)
+        prefs = self.entry.human_result({'preferences': {'auto_sync': True, 'interval_minutes': 0, 'context_mode': 'turn',
+                                                         'context_chars': 5000, 'secret_filter': False},
+                                         'companion_limits': {'Last-Session.md': 0, 'Threads.md': 8000}}, 'preferences')
+        self.assertIn('Hafiza dosyasi siniri, Last-Session.md: kapali', prefs)
+        self.assertIn('Hafiza dosyasi siniri, Threads.md: 8000 karakter', prefs)
+        compacted = self.entry.human_result({'status': 'needs_rewrite', 'files': {
+            'Last-Session.md': {'status': 'compacted', 'chars': 94000, 'chars_after': 2900, 'moved_chars': 91200,
+                                'limit': 3000, 'within_limit_after': True},
+            'Threads.md': {'status': 'needs_rewrite', 'chars': 9000, 'limit': 8000}}}, 'companion-compact')
+        self.assertIn('Last-Session.md: 94000 -> 2900 karakter, 91200 karakter arsive tasindi.', compacted)
+        self.assertIn('Threads.md: tasinacak tarihli eski kayit yok', compacted)
+        self.assertTrue(compacted.endswith('Hicbir metin silinmedi; model cagrilmadi.'))
+        planned = self.entry.human_result({'status': 'dry_run', 'files': {
+            'Threads.md': {'status': 'planned', 'chars': 9000, 'chars_after': 8100, 'moved_chars': 900,
+                           'limit': 8000, 'within_limit_after': False}}}, 'companion-compact')
+        self.assertIn('8100 karakter olacak, 900 karakter arsive tasinacak.', planned)
+        self.assertIn('Threads.md hala sinirin (8000) ustunde', planned)
+        odd = self.entry.human_result({'status': 'needs_attention', 'files': {
+            'Threads.md': {'status': 'needs_attention', 'reason': 'not UTF-8; nothing moved'}}}, 'companion-compact')
+        self.assertIn('Threads.md: not UTF-8; nothing moved.', odd)
+        refused = self.entry.human_result({'status': 'needs_attention', 'files': {}, 'limits_file': 'invalid'}, 'companion-compact')
+        self.assertIn('Sinir ayari okunamadi', refused)
+
+
+class CompactionPlanTest(unittest.TestCase):
+    POINTER = 'Arşivlenen metin: `X/Arşiv/A-2026-09.md`'
+
+    def plan(self, text, name, limit):
+        result = compact_module.plan(text, name, limit, self.POINTER)
+        lines = compact_module.LINE.findall(text)
+        moved = set(result['moved_lines'])
+        kept = ''.join(line for index, line in enumerate(lines) if index not in moved)
+        newline = result['newline']
+        pointer = self.POINTER + newline
+        if pointer in result['live'] and compact_module.ADDED_HISTORY[name] not in result['live']:
+            self.assertEqual(result['live'].replace(pointer, '', 1), kept)
+        else:
+            self.assertEqual(result['live'], (kept if kept.endswith('\n') else kept + newline) + newline +
+                             compact_module.ADDED_HISTORY[name] + newline + newline + pointer)
+        position = 0
+        for index in sorted(moved):  # moved lines appear verbatim and in order in the archive
+            found = result['archive'].find(lines[index].rstrip('\r\n'), position)
+            self.assertGreaterEqual(found, 0, lines[index])
+            position = found
+        return result
+
+    def test_append_ordered_entries_keep_the_bottom_one(self):
+        text = ('# Son oturum\n\n' + ''.join(f'2026-09-{day:02d}: GÜN_{day} ' + FILLER + '\n\n' for day in range(1, 11)))
+        result = self.plan(text, 'Last-Session.md', 400)
+        # Oldest first and only until the file fits: the two newest stay.
+        self.assertEqual(result['moved_entries'], 8)
+        for day in (9, 10):
+            self.assertIn(f'GÜN_{day} ', result['live'])
+        for day in range(1, 9):
+            self.assertNotIn(f'GÜN_{day} ', result['live'])
+        self.assertLessEqual(len(result['live']), 400)
+        tight = self.plan(text, 'Last-Session.md', 150)
+        self.assertEqual(tight['moved_entries'], 9, 'the newest entry never moves, even when the file stays over')
+        self.assertIn('GÜN_10', tight['live'])
+
+    def test_same_day_entries_follow_the_file_direction(self):
+        newest_first = '# Son oturum\n\n2026-09-24: ÜST\n\n2026-09-24: ALT ' + FILLER * 3 + '\n'
+        self.assertIn('ÜST', self.plan(newest_first, 'Last-Session.md', 120)['live'])
+        timed = '# Son oturum\n\n2026-09-24 09:00: SABAH ' + FILLER * 3 + '\n\n2026-09-24 21:30: AKŞAM\n'
+        live = self.plan(timed, 'Last-Session.md', 120)['live']
+        self.assertIn('AKŞAM', live)
+        self.assertNotIn('SABAH', live)
+
+    def test_plan_mixed_order(self):
+        text = ('# Son oturum\n\n## Session: 2026-09-25\nILK_YENI\n\n## Session: 2026-09-24\nORTA\n\n'
+                '## Session: 2026-09-25\nIKINCI_YENI\n')
+        # Mixed dates: 25 -> 24 is falling, 24 -> 25 is rising.
+        # Last-Session.md must fall back to newest_first (keeping the top-most card when dates tie).
+        result = self.plan(text, 'Last-Session.md', 10)
+        self.assertIn('ILK_YENI', result['live'])
+        self.assertNotIn('IKINCI_YENI', result['live'])
+
+    def test_same_day_thread_updates_keep_the_bottom_one(self):
+        # The reproduction from #163: thread updates are appended, so the bottom one is newest.
+        text = ('# Threads\n\n## Active Threads\n### Thread: Volt\n**Status:** Active\n'
+                '2026-09-28 kontrol: ÜST hâlâ 0 testçi. ' + FILLER + '\n'
+                '2026-09-28: ORTA 8 testçi kayıtlı. ' + FILLER + '\n'
+                '**2026-09-28: ALT 12+ testçi, kapalı test başladı.**\n\n## Closed Threads\n')
+        result = self.plan(text, 'Threads.md', len(text) - 60)
+        self.assertIn('ALT 12+', result['live'])
+        self.assertNotIn('ÜST', result['live'])
+        self.assertIn('ÜST', result['archive'])
+
+    def test_v2_session_headings_and_structured_handoff_blocks(self):
+        text = ('# Last Session\n\n## Session: 2026-09-24 (Codex)\nYENİ\n### Açık kalanlar\n- test\n\n'
+                '## Session: 2026-09-20\nESKİ ' + FILLER * 4 + '\n\n## Previous Sessions\n(none yet)\n')
+        result = self.plan(text, 'Last-Session.md', 200)
+        self.assertIn('## Session: 2026-09-24 (Codex)\nYENİ\n### Açık kalanlar\n- test\n', result['live'])
+        self.assertIn('## Previous Sessions\n' + self.POINTER + '\n', result['live'])
+        self.assertIn('## Session: 2026-09-20', result['archive'])
+        self.assertIn('## Previous Sessions\n(none yet)\n', result['archive'])
+
+    def test_multi_card_parallel_session_headings_keep_newest_card(self):
+        text = (
+            '# Son oturum\n\n'
+            '## 2026-09-26 16:30 · ev · 3f9a1c2b\n'
+            'EN_YENİ_KART: 4. oturum kararı ve sonraki adım.\n- test adımı\n\n'
+            '## 2026-09-26 14:15 · ofis · 7c8b2d1a\n'
+            'KART_3: 3. oturum kararı. ' + FILLER * 3 + '\n\n'
+            '## 2026-09-26 11:00 · ev · 1a2b3c4d\n'
+            'KART_2: 2. oturum kararı. ' + FILLER * 3 + '\n\n'
+            '## 2026-09-26 09:00 · ofis · 9e8d7c6b\n'
+            'EN_ESKİ_KART_1: 1. oturum kararı. ' + FILLER * 3 + '\n'
+        )
+        result = self.plan(text, 'Last-Session.md', 350)
+        self.assertIn('## 2026-09-26 16:30 · ev · 3f9a1c2b\nEN_YENİ_KART: 4. oturum kararı', result['live'])
+        self.assertNotIn('EN_ESKİ_KART_1', result['live'])
+        self.assertIn('EN_ESKİ_KART_1', result['archive'])
+        self.assertIn('## Önceki oturumlar\n\n' + self.POINTER, result['live'])
+        self.assertLessEqual(len(result['live']), 350)
+
+    def test_written_out_dates_are_entries_ordered_by_their_day(self):
+        # A Turkish vault writes `## 12 Ekim 2026: ...`; without this nothing was dated and the
+        # whole file ended in needs_rewrite. A range counts by its last day; the order is the
+        # calendar, not the text (`4→5 Ekim` is older than `12 Ekim`, `26–27 Eylül` older still).
+        text = ('# Son oturum\n\n'
+                '## 12 Ekim 2026 (gece): EN_YENİ\nkarar\n\n'
+                '## 2026-10-11 21:00 · ev · 1a2b3c4d\nISO_KART ' + FILLER * 3 + '\n\n'
+                '## 4→5 Ekim 2026: ARALIK ' + FILLER * 3 + '\n\n'
+                '## 26–27 Eylül 2026: EYLÜL ' + FILLER * 3 + '\n\n'
+                '## 3 October 2025: ENGLISH ' + FILLER * 3 + '\n')
+        result = self.plan(text, 'Last-Session.md', 200)
+        self.assertEqual(result['moved_entries'], 4)
+        self.assertIn('EN_YENİ', result['live'])
+        for old in ('ISO_KART', 'ARALIK', 'EYLÜL', 'ENGLISH'):
+            self.assertNotIn(old, result['live'])
+        self.assertEqual(compact_module.stamp('## 4→5 Ekim 2026: x', heading=True), ('2026-10-05', ''))
+        self.assertEqual(compact_module.stamp('- 9 MAYIS 2026 14:05 not'), ('2026-05-09', '14:05'))
+        self.assertEqual(compact_module.stamp('## 12 EKİM 2026: x', heading=True), ('2026-10-12', ''))
+        self.assertEqual(compact_module.stamp(unicodedata.normalize('NFD', '## 12 Şubat 2026: x'), heading=True), ('2026-02-12', ''))
+        for undated in ('## 2026-02-31: x', '## 31 Şubat 2026: x', '**Durum:** 12 Ekim 2026', '## Kasım planı 2026', '## 12 Ekimde 2026'):
+            self.assertIsNone(compact_module.stamp(undated, heading=undated.startswith('#')), undated)
+
+    def test_thread_fields_with_dates_code_fences_and_crlf_stay(self):
+        text = ('# Threads\r\n## Active Threads\r\n### Thread: A\r\n**Status:** waiting, 2026-10-01\r\n'
+                'Next action: 2026-09-30 tarihine kadar karar.\r\n- 2026-09-24 A_YENİ\r\n- 2026-09-10 A_ESKİ ' + FILLER * 3 + '\r\n'
+                '```\r\n## 2026-01-01 kod içindeki başlık\r\n2026-01-02: kod satırı\r\n```\r\n'
+                '### Thread: B\r\n2026-09-01: B_TEK ' + FILLER + '\r\n')
+        result = self.plan(text, 'Threads.md', 400)
+        live = result['live']
+        self.assertNotIn('\n', live.replace('\r\n', ''))
+        for kept in ('**Status:** waiting, 2026-10-01', 'Next action: 2026-09-30', 'A_YENİ', '### Thread: B\r\n2026-09-01: B_TEK'):
+            self.assertIn(kept, live)
+        # The fenced block is part of the older update: it moves with it, whole and in
+        # order, and the heading-like line inside the fence never became a section.
+        self.assertIn('### Thread: A\r\n- 2026-09-10 A_ESKİ ' + FILLER * 3 + '\r\n```\r\n## 2026-01-01 kod içindeki başlık\r\n'
+                      '2026-01-02: kod satırı\r\n```\r\n', result['archive'])
+        self.assertEqual(result['moved_entries'], 1)
+        self.assertIn('## Kapanan konular\r\n\r\n' + self.POINTER + '\r\n', live)
+
+    def test_undated_structure_after_an_old_entry_stays(self):
+        text = ('# Son oturum\n\n## Session: 2026-09-24\nYENİ\n\n## Session: 2026-09-01\nESKİ ' + FILLER * 3 +
+                '\n#### Ayrıntı\nESKİ_ALT\n\n## Notlar\nNOT_KALIR\n\n2026-08-01: ÇOK_ESKİ ' + FILLER + '\n\n### Bağlantılar\nBAĞ_KALIR\n')
+        result = self.plan(text, 'Last-Session.md', 200)
+        for kept in ('## Notlar\nNOT_KALIR\n', '### Bağlantılar\nBAĞ_KALIR\n', 'YENİ'):
+            self.assertIn(kept, result['live'])
+        for moved in ('ESKİ ', '#### Ayrıntı\nESKİ_ALT', 'ÇOK_ESKİ'):
+            self.assertIn(moved, result['archive'])
+            self.assertNotIn(moved, result['live'])
+
+    def test_dated_lines_inside_the_newest_card_never_split_it(self):
+        # #118: an older date quoted inside a card is card content, not an older entry, so
+        # the newest card keeps its next step and the older card moves whole.
+        newest_head = '## 2026-09-27 10:00 · ev · 955bfafa\nEN_YENİ_KART: PR hazırlandı.\n'
+        next_step = '- Sıradaki: gözden geçirme.\n\n'
+        older = ('## 2026-09-26 14:05 · ofis · 3f9a1c2b\nESKİ_KART: ' + FILLER * 3 + '\n'
+                 '- 2026-09-25 ESKİ_KARTIN_MADDESİ\n### Ayrıntı\n2026-09-24: ESKİ_ALT\n')
+        for inner in ('- 2026-09-20 kararı hâlâ geçerli.\n', '- Karar (2026-09-20) geçerli.\n',
+                      '\n2026-09-20 kararı geçerli.\n', '### 2026-09-20 notları\nnot\n',
+                      '- 2026-10-01 teslim tarihi.\n'):
+            with self.subTest(inner=inner):
+                newest = newest_head + inner + next_step
+                result = self.plan('# Son oturum\n\n' + newest + older, 'Last-Session.md', 450)
+                self.assertIn(newest, result['live'])
+                self.assertIn(older, result['archive'])
+                self.assertEqual(result['moved_entries'], 1, 'each card moves whole, as one entry')
+                for moved in ('ESKİ_KART', 'ESKİ_KARTIN_MADDESİ', 'ESKİ_ALT'):
+                    self.assertNotIn(moved, result['live'])
+                self.assertLessEqual(len(result['live']), 450)
+
+    def test_a_card_ends_at_a_heading_of_its_own_level(self):
+        text = ('# Son oturum\n\n## 2026-09-27 10:00 · ev\nYENİ\n\n## 2026-09-26 09:00 · ofis\nORTA ' + FILLER * 2 +
+                '\n\n## Notlar\nNOT_KALIR\n2026-09-01: NOTLARDAKİ_ESKİ ' + FILLER * 2 + '\n')
+        result = self.plan(text, 'Last-Session.md', 200)
+        self.assertEqual(result['moved_entries'], 2)
+        self.assertIn('## 2026-09-27 10:00 · ev\nYENİ\n', result['live'])
+        self.assertIn('## Notlar\nNOT_KALIR\n', result['live'])
+        for moved in ('ORTA', 'NOTLARDAKİ_ESKİ'):
+            self.assertIn(moved, result['archive'])
+            self.assertNotIn(moved, result['live'])
+
+    def test_dated_update_headings_keep_their_dated_items_in_threads(self):
+        text = ('# Threads\n## Active Threads\n### Thread: A\n#### 2026-09-24 güncelleme\nA_YENİ\n'
+                '- 2026-09-01 A_YENİNİN_MADDESİ\n#### 2026-09-10 güncelleme\nA_ESKİ ' + FILLER * 3 + '\n'
+                '- 2026-09-02 A_ESKİNİN_MADDESİ\n')
+        result = self.plan(text, 'Threads.md', 250)
+        self.assertEqual(result['moved_entries'], 1)
+        self.assertIn('#### 2026-09-24 güncelleme\nA_YENİ\n- 2026-09-01 A_YENİNİN_MADDESİ\n', result['live'])
+        self.assertIn('### Thread: A\n#### 2026-09-10 güncelleme\nA_ESKİ ' + FILLER * 3 + '\n- 2026-09-02 A_ESKİNİN_MADDESİ\n',
+                      result['archive'])
+
+    def test_dated_lines_directly_under_active_threads_never_move(self):
+        text = ('# Threads\n2026-09-02: BAŞLIK_ALTI\n## Active Threads\n' +
+                ''.join(f'- 2026-09-{day:02d} KONU_{day} ' + FILLER + '\n' for day in range(1, 20)) +
+                '### Thread: A\n2026-09-24: A_YENİ\n2026-09-01: A_ESKİ ' + FILLER + '\n')
+        result = self.plan(text, 'Threads.md', 300)
+        self.assertEqual(result['moved_entries'], 1)
+        self.assertIn('A_ESKİ', result['archive'])
+        for day in range(1, 20):
+            self.assertIn(f'KONU_{day} ', result['live'])
+        self.assertIn('BAŞLIK_ALTI', result['live'])
+        self.assertIsNone(compact_module.plan(text.replace('2026-09-01: A_ESKİ', 'A_ESKİ'), 'Threads.md', 300, self.POINTER))
+        turkish = text.replace('## Active Threads', '## Açık konular')
+        self.assertEqual(self.plan(turkish, 'Threads.md', 300)['moved_entries'], 1)
+
+    def test_nothing_movable_returns_none(self):
+        text = '# Threads\n## Active Threads\n### Thread: A\n2026-09-24: TEK ' + FILLER * 5 + '\n'
+        self.assertIsNone(compact_module.plan(text, 'Threads.md', 100, self.POINTER))
+        self.assertIsNone(compact_module.plan('# Son oturum\n' + FILLER * 5, 'Last-Session.md', 100, self.POINTER))
+
+    def test_frontmatter_stays_and_is_never_an_entry(self):
+        text = ('---\nupdated: 2026-09-24\n---\n# Son oturum\n2026-09-24: YENİ\n\n2026-09-01: ESKİ ' + FILLER * 3 + '\n')
+        result = self.plan(text, 'Last-Session.md', 150)
+        self.assertTrue(result['live'].startswith('---\nupdated: 2026-09-24\n---\n# Son oturum\n2026-09-24: YENİ\n'))
+
+
+class CompactionRaceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='companion-race-')
+        self.addCleanup(self.tmp.cleanup)
+        self.vault = Path(self.tmp.name).resolve() / 'vault'
+        self.directory = self.vault / COMPANION
+        self.directory.mkdir(parents=True)
+        self.state = Path(self.tmp.name) / 'state'
+        self.live = self.directory / 'Last-Session.md'
+        self.live.write_text(oversized_last_session(8), encoding='utf-8')
+        self.archive = self.directory / 'Arşiv' / 'Last-Session-2026-09.md'
+
+    def racing(self):
+        original = compact_module._write
+
+        def write(path, text):
+            original(path, text)
+            if Path(path).parent.name == 'Arşiv':
+                with self.live.open('a', encoding='utf-8') as handle:
+                    handle.write('CONCURRENT_EDIT\n')
+        return mock.patch.object(compact_module, '_write', write)
+
+    def test_a_concurrent_edit_wins_and_a_new_archive_is_removed(self):
+        with self.racing():
+            result = compact_module.compact(self.vault, self.state, now=NOW)
+        self.assertEqual(result['status'], 'conflict')
+        self.assertTrue(self.live.read_text(encoding='utf-8').endswith('CONCURRENT_EDIT\n'))
+        self.assertIn('ENTRY_007', self.live.read_text(encoding='utf-8'))
+        self.assertFalse(self.archive.exists())
+
+    def test_a_concurrent_edit_during_a_needs_rewrite_backup_removes_the_backup(self):
+        self.live.write_text('# Son oturum\n\n' + FILLER * 60, encoding='utf-8')
+        with self.racing():
+            result = compact_module.compact(self.vault, self.state, now=NOW)
+        self.assertEqual(result['files']['Last-Session.md']['status'], 'conflict')
+        self.assertNotIn('backup', result['files']['Last-Session.md'])
+        self.assertTrue(self.live.read_text(encoding='utf-8').endswith('CONCURRENT_EDIT\n'))
+        self.assertFalse(self.archive.exists())
+
+    def test_a_concurrent_edit_restores_an_existing_archive_byte_for_byte(self):
+        self.archive.parent.mkdir()
+        self.archive.write_bytes(b'# Kullanicinin arsivi\n')
+        with self.racing():
+            result = compact_module.compact(self.vault, self.state, now=NOW)
+        self.assertEqual(result['files']['Last-Session.md']['status'], 'conflict')
+        self.assertEqual(self.archive.read_bytes(), b'# Kullanicinin arsivi\n')
+
+    def test_concurrent_call_archive_is_not_reverted_on_conflict(self):
+        """#193: A conflicting compact must not roll back if the archive was modified by another caller."""
+        original = compact_module._write
+
+        def write(path, text):
+            original(path, text)
+            if Path(path).parent.name == 'Arşiv':
+                # Simulate another caller committing its own archive and live update
+                self.archive.write_bytes(b'# CONCURRENT_CALLER_ARCHIVE_DATA\n')
+                with self.live.open('a', encoding='utf-8') as handle:
+                    handle.write('CONCURRENT_EDIT\n')
+
+        with mock.patch.object(compact_module, '_write', write):
+            result = compact_module.compact(self.vault, self.state, now=NOW)
+        self.assertEqual(result['status'], 'conflict')
+        self.assertTrue(self.archive.exists())
+        self.assertEqual(self.archive.read_bytes(), b'# CONCURRENT_CALLER_ARCHIVE_DATA\n')
+
+    def test_different_state_processes_share_the_companion_lock(self):
+        """#193: state isolation must not split the lock for one canonical vault."""
+        for existing_archive in (False, True):
+            with self.subTest(existing_archive=existing_archive):
+                self.live.write_text(
+                    '# Son oturum\n\n## 2026-09-01 09:00 · eski · a\n' + RACE_OLD
+                    + '\n' + 'eski veri ' * 300
+                    + '\n\n## 2026-09-02 09:00 · yeni · b\nNEWEST_CARD_CONTENT\n'
+                    + 'yeni veri ' * 300 + '\n', encoding='utf-8')
+                if self.archive.exists():
+                    self.archive.unlink()
+                if existing_archive:
+                    self.archive.parent.mkdir(exist_ok=True)
+                    self.archive.write_text('# EXISTING_ARCHIVE_MARKER\n', encoding='utf-8')
+
+                slow_state = Path(self.tmp.name) / f'state-slow-{existing_archive}'
+                fast_state = Path(self.tmp.name) / f'state-fast-{existing_archive}'
+                context = mp.get_context('spawn')
+                ready, resume, done = context.Event(), context.Event(), context.Event()
+                out = context.Queue()
+                slow = context.Process(target=compact_race_slow,
+                                       args=(self.vault, slow_state, ready, resume, out))
+                slow.start()
+                self.addCleanup(stop_process, slow)
+                self.addCleanup(resume.set)
+                self.assertTrue(ready.wait(RACE_READY), 'slow process did not reach archive write')
+                fast = context.Process(target=compact_race_fast,
+                                       args=(self.vault, fast_state, done, out))
+                fast.start()
+                self.addCleanup(stop_process, fast)
+                done.wait(RACE_PROBE)  # Observation window, never a success criterion.
+                resume.set()
+                slow.join(RACE_JOIN)
+                fast.join(RACE_JOIN)
+                for process in (slow, fast):
+                    if process.is_alive():
+                        process.terminate()
+                        process.join()
+                self.assertEqual((slow.exitcode, fast.exitcode), (0, 0))
+                results = dict(out.get(timeout=5) for _ in range(2))
+                self.assertIn(results['slow']['files']['Last-Session.md']['status'],
+                              {'compacted', 'needs_rewrite'})
+                live_text = self.live.read_text(encoding='utf-8')
+                archive_text = self.archive.read_text(encoding='utf-8') if self.archive.exists() else ''
+                self.assertIn(RACE_OLD, live_text + archive_text)
+                self.assertIn(RACE_OLD, archive_text)
+                self.assertIn('eski veri ' * 300, archive_text)
+                self.assertIn('NEWEST_CARD_CONTENT', live_text)
+                if existing_archive:
+                    self.assertIn('EXISTING_ARCHIVE_MARKER', archive_text)
+                for result in results.values():
+                    self.assertIn(result['files']['Last-Session.md']['status'],
+                                  {'compacted', 'needs_rewrite', 'within_limit', 'conflict'})
+                out.close()
+                out.join_thread()
+
+    def test_lock_failure_reports_needs_attention_without_modifying_files(self):
+        original_open = Path.open
+
+        def open_path(target, *args, **kwargs):
+            if target.name == compact_module.LOCK_NAME:
+                raise OSError('Permission denied')
+            return original_open(target, *args, **kwargs)
+
+        before = self.live.read_bytes()
+        with mock.patch.object(Path, 'open', open_path):
+            result = compact_module.compact(self.vault, self.state, now=NOW)
+        self.assertEqual(result['status'], 'needs_attention')
+        self.assertIn('cannot open compaction lock', result['reason'])
+        self.assertEqual(self.live.read_bytes(), before)
+        self.assertFalse(self.archive.exists())
+
+    def test_missing_companion_returns_without_creating_or_entering_compaction(self):
+        other_vault = Path(self.tmp.name) / 'empty-vault'
+        other_vault.mkdir()
+        with mock.patch.object(compact_module, '_compact_files',
+                               side_effect=AssertionError('missing companion entered compaction')):
+            result = compact_module.compact(other_vault, self.state, now=NOW)
+        self.assertEqual(result['status'], 'within_limit')
+        self.assertEqual(result['files'], {})
+        self.assertFalse((other_vault / COMPANION).exists())
+
+    def test_content_io_failure_is_not_reported_as_lock_failure(self):
+        original_read = Path.read_bytes
+
+        def read(path):
+            if path.resolve() == self.live.resolve():
+                raise OSError('synthetic content read failure')
+            return original_read(path)
+
+        with mock.patch.object(Path, 'read_bytes', read):
+            with self.assertRaisesRegex(OSError, 'synthetic content read failure'):
+                compact_module.compact(self.vault, self.state, now=NOW)
+
+    def test_lock_contention_returns_conflict_timeout(self):
+        original_lock = compact_module._compact_lock
+        with original_lock(self.directory):
+            with mock.patch.object(compact_module, '_compact_lock',
+                                   lambda target: original_lock(target, timeout=0.1, step=0.02)):
+                result = compact_module.compact(self.vault, self.state, now=NOW)
+        self.assertEqual(result['status'], 'conflict')
+        self.assertIn('vault compaction lock busy', result['reason'])
+        self.assertFalse(self.archive.exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX advisory lock error injection')
+    def test_lock_api_failure_does_not_masquerade_as_contention(self):
+        import fcntl
+        before = self.live.read_bytes()
+        with mock.patch.object(fcntl, 'flock', side_effect=OSError(errno.ENOLCK, 'no locks available')):
+            result = compact_module.compact(self.vault, self.state, now=NOW)
+        self.assertEqual(result['status'], 'needs_attention')
+        self.assertEqual(before, self.live.read_bytes())
+        self.assertFalse(self.archive.exists())
+
+    def test_dry_run_does_not_lock_write_or_change_tree(self):
+        companion_module.save_limits(self.state, {'Last-Session.md': 3000, 'Threads.md': 8000})
+        before = tree_snapshot(Path(self.tmp.name))
+        with mock.patch.object(compact_module, '_compact_lock', side_effect=AssertionError('dry-run locked')):
+            with mock.patch.object(compact_module, '_write', side_effect=AssertionError('dry-run wrote')):
+                result = compact_module.compact(self.vault, self.state, dry_run=True, now=NOW)
+        self.assertEqual(result['status'], 'dry_run')
+        self.assertEqual(before, tree_snapshot(Path(self.tmp.name)))
+
+    def test_external_archive_edit_between_snapshot_and_prewrite_is_preserved(self):
+        self.archive.parent.mkdir()
+        previous = b'# PREVIOUS\n'
+        edited = previous + b'EXTERNAL_APPEND\n'
+        self.archive.write_bytes(previous)
+        original_read = Path.read_bytes
+        changed = False
+
+        def read(path):
+            nonlocal changed
+            content = original_read(path)
+            if path.resolve() == self.archive.resolve() and not changed:
+                changed = True
+                path.write_bytes(edited)
+            return content
+
+        live = self.live.read_bytes()
+        with mock.patch.object(Path, 'read_bytes', read):
+            result = compact_module.compact(self.vault, self.state, now=NOW)
+        self.assertEqual(result['status'], 'conflict')
+        self.assertEqual(self.archive.read_bytes(), edited)
+        self.assertEqual(self.live.read_bytes(), live)
+
+    def test_process_exit_releases_lock_for_retry(self):
+        context = mp.get_context('spawn')
+        ready = context.Event()
+        process = context.Process(target=acquire_compact_lock_and_exit,
+                                  args=(self.directory, ready))
+        process.start()
+        self.addCleanup(stop_process, process)
+        self.assertTrue(ready.wait(RACE_READY), 'child did not acquire compaction lock')
+        process.join(RACE_JOIN)
+        self.assertEqual(process.exitcode, 17)
+        result = compact_module.compact(self.vault, self.state, now=NOW)
+        self.assertNotEqual(result['status'], 'conflict')
+        self.assertIn(result['files']['Last-Session.md']['status'],
+                      {'compacted', 'needs_rewrite'})
+        self.assertIn('ENTRY_007', self.live.read_text(encoding='utf-8') + self.archive.read_text(encoding='utf-8'))
+
+    def test_hygiene_counts_characters_and_names_the_directory(self):
+        report = companion_module.hygiene(self.vault, self.state)
+        self.assertEqual(report['directory'], COMPANION)
+        # Characters as stored: on Windows this fixture is written with CRLF, and each CRLF counts
+        # as two, the same measure companion-compact fits the file to.
+        self.assertEqual(report['files']['Last-Session.md']['chars'], len(self.live.read_bytes().decode('utf-8')))
+        self.assertEqual(report['over_limit'], ['Last-Session.md'])
+        self.assertIn('Memory hygiene: Last-Session.md is', companion_module.hygiene_notice(report))
+
+    def test_compact_rejects_unreadable_identity_without_writing(self):
+        blocked = self.vault / 'Blocked Companion'
+        blocked.mkdir()
+        (blocked / 'Core.md').write_text('# blocked', encoding='utf-8')
+        real_stat = Path.stat
+        before = {p.relative_to(self.vault).as_posix(): p.read_bytes()
+                  for p in self.vault.rglob('*') if p.is_file()}
+
+        def stat(path, *args, **kwargs):
+            if os.fspath(path) == os.fspath(blocked):
+                raise PermissionError('synthetic candidate failure')
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'stat', stat):
+            with self.assertRaisesRegex(RuntimeError, 'cannot inspect companion directory candidates'):
+                compact_module.compact(self.vault, self.state, now=NOW)
+        after = {p.relative_to(self.vault).as_posix(): p.read_bytes()
+                 for p in self.vault.rglob('*') if p.is_file()}
+        self.assertEqual(after, before)
+        self.assertFalse(self.state.exists())
+
+    def test_compact_fails_closed_when_all_directory_candidates_are_unreadable(self):
+        blocked = self.vault / 'Blocked Companion'
+        blocked.mkdir()
+        (blocked / 'Core.md').write_text('# blocked', encoding='utf-8')
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if os.fspath(path) in {os.fspath(blocked), os.fspath(self.directory)}:
+                raise PermissionError('synthetic candidate failure')
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'stat', stat):
+            with self.assertRaisesRegex(RuntimeError, 'cannot inspect companion directory candidates'):
+                compact_module.compact(self.vault, self.state, now=NOW)
+
+    def test_hygiene_notice_reports_clipped_rules_and_handoff_files(self):
+        report = companion_module.hygiene(self.vault, self.state)
+        # 1. Rules alone clipped (#461)
+        rules_clipped = {'chars': 10303, 'share': 3496, 'clipped': True}
+        notice_rules = companion_module.hygiene_notice(None, rules=rules_clipped)
+        self.assertEqual(
+            notice_rules,
+            'Memory hygiene: Kurallar.md opens clipped (fit ceiling 3496 of 10303 chars). '
+            'Shorten each rule to one line and move reasons to a detail note; '
+            'move project rules to projects/<proje>/Kurallar.md.\n'
+        )
+        # 2. Both handoff file over limit and rules clipped
+        notice_both = companion_module.hygiene_notice(report, rules=rules_clipped)
+        self.assertIn('Memory hygiene: Last-Session.md is', notice_both)
+        self.assertIn('companion-compact', notice_both)
+        self.assertIn('Memory hygiene: Kurallar.md opens clipped (fit ceiling 3496 of 10303 chars).', notice_both)
+        self.assertEqual(notice_both.count('Memory hygiene: '), 2)
+        # 3. Rules not clipped
+        rules_ok = {'chars': 2928, 'share': 3496, 'clipped': False}
+        notice_ok = companion_module.hygiene_notice(None, rules=rules_ok)
+        self.assertEqual(notice_ok, '')
+        notice_handoff_only = companion_module.hygiene_notice(report, rules=rules_ok)
+        self.assertEqual(notice_handoff_only.count('Memory hygiene: '), 1)
+        self.assertNotIn('Kurallar.md', notice_handoff_only)
+
+    def test_single_line_code_blocks_dont_swallow_subsequent_headings(self):
+        """Code block on a single line '```code```' shouldn't leave parser in fence state."""
+        lines = [
+            "# Last-Session.md\n",
+            "```python print('hello') ```\n",
+            "## 2026-09-25 10:00 UTC\n",
+            "A card here\n"
+        ]
+        parsed = compact_module.blocks(lines, 'Last-Session.md')
+        has_entry = any(p['kind'] == 'entry' for p in parsed)
+        self.assertTrue(has_entry, "The subsequent valid date heading should be an entry, not swallowed by a single-line code block.")
+
+    def test_single_line_multiple_fences(self):
+        """Testing multiple fences in the same line like ```code``` ```other```"""
+        lines = [
+            "# Last-Session.md\n",
+            "```python code ``` ```other```\n",
+            "## 2026-09-25 10:00 UTC\n",
+            "A card here\n"
+        ]
+        parsed = compact_module.blocks(lines, 'Last-Session.md')
+        has_entry = any(p['kind'] == 'entry' for p in parsed)
+        self.assertTrue(has_entry, "Should handle multiple blocks on the same line properly.")
+
+    def test_real_fences_still_hide_dated_headings(self):
+        # An info string without backticks still opens a fence (```python), and a tilde fence may
+        # carry backticks or tildes in its info string; the dated line inside stays code.
+        for opener in ('```python\n', '~~~ text ~~~\n', '~~~ `x`\n'):
+            with self.subTest(opener=opener):
+                lines = ['# Last-Session.md\n', opener, '## 2026-09-25 10:00 UTC\n', opener[:3] + '\n']
+                parsed = compact_module.blocks(lines, 'Last-Session.md')
+                self.assertFalse(any(p['kind'] == 'entry' for p in parsed), parsed)
+
+    def test_hygiene_include_projects_returns_ambiguous_directory_without_keyerror(self):
+        alt = self.directory.parent / 'Companion'
+        alt.mkdir(exist_ok=True)
+        (alt / 'Core.md').write_text('# Alt\n', encoding='utf-8')
+        rep = companion_module.hygiene(self.vault, self.state, include_projects=True)
+        self.assertEqual(rep['status'], 'ambiguous_directory')
+
+    def test_project_companion_hygiene_checks_limits_and_skips_excluded_dirs(self):
+        proj_demo = self.vault / 'projects' / 'demo'
+        proj_demo.mkdir(parents=True)
+        (proj_demo / 'Threads.md').write_text('# Threads\n' + 'x' * 9000, encoding='utf-8')
+
+        proj_secret = self.vault / 'projects' / 'secret_proj'
+        proj_secret.mkdir(parents=True)
+        (proj_secret / 'Threads.md').write_text('# Threads\n' + 'x' * 9000, encoding='utf-8')
+
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / 'index.json').write_text(json.dumps({'schema': 1, 'excluded_dirs': ['secret_proj']}), encoding='utf-8')
+
+        private_project = self.vault / 'projects' / 'Şifre'
+        private_project.mkdir()
+        (private_project / 'Threads.md').write_text('Private', encoding='utf-8')
+        rep = companion_module.hygiene(self.vault, self.state, include_projects=True)
+        self.assertNotIn('projects/Şifre', rep['project_directories'])
+        self.assertEqual(rep['project_directories'].count('projects/demo'), 1)
+        self.assertEqual(rep['status'], 'over_limit')
+        self.assertIn('projects/demo/Threads.md', rep['over_limit'])
+        self.assertNotIn('projects/secret_proj', rep['project_directories'])
+
+
+if __name__ == '__main__':
+    unittest.main()

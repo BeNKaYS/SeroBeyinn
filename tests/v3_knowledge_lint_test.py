@@ -1,0 +1,929 @@
+"""Tests for Obsidian-Native Knowledge Organization & Lint (RFC #368 P0-E)."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "template/.claude/scripts"))
+
+import serobeyinn_v3 as runtime
+import serobeyinn_v3_lint as linter
+from v3_package_helpers import inherited_env
+
+CLI_SPEC = importlib.util.spec_from_file_location("serobeyinn_cli", ROOT / "scripts/serobeyinn_v3.py")
+cli = importlib.util.module_from_spec(CLI_SPEC)
+CLI_SPEC.loader.exec_module(cli)
+
+
+class KnowledgeLintTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.vault = Path(self.tmp.name) / "vault"
+        self.vault.mkdir()
+        self.state = Path(self.tmp.name) / "state"
+        self.state.mkdir()
+
+    def _owned_moc(self, extra=''):
+        (self.vault / 'knowledge').mkdir(exist_ok=True)
+        (self.vault / 'knowledge/a.md').write_text('# A', encoding='utf-8')
+        target = self.vault / 'knowledge/MOC.md'
+        target.write_text('Handwritten text\n' + linter.MOC_START_MARKER + '\nold\n' + linter.MOC_END_MARKER + '\n' + extra,
+                          encoding='utf-8')
+        return target
+
+    def test_moc_refuses_concurrent_edit_after_snapshot(self):
+        # Obsidian does not take the vault lock: it saves after the snapshot, while the
+        # replacement is being prepared. The last check before the rename must see it.
+        target = self._owned_moc()
+        original_mkstemp = tempfile.mkstemp
+        def editor_saves(*args, **kwargs):
+            with open(target, 'a', encoding='utf-8') as handle:
+                handle.write('Concurrent user text\n')
+            return original_mkstemp(*args, **kwargs)
+        with patch.object(tempfile, 'mkstemp', editor_saves):
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                linter.generate_moc(self.vault)
+        text = target.read_text(encoding='utf-8')
+        self.assertIn('Concurrent user text', text)
+        self.assertIn('\nold\n', text)
+        self.assertEqual([p.name for p in target.parent.iterdir() if p.name.startswith('.serobeyinn')], [])
+
+    @unittest.skipIf(os.name == 'nt', 'Windows cannot rename over an open file; only the pre-rename check applies')
+    def test_moc_restores_in_place_save_inside_replace_window(self):
+        target = self._owned_moc()
+        original_replace = os.replace
+        def editor_saves_then_rename(source, destination, *args, **kwargs):
+            if Path(destination).resolve() == target.resolve():
+                with open(target, 'a', encoding='utf-8') as handle:
+                    handle.write('Window edit\n')
+            return original_replace(source, destination, *args, **kwargs)
+        with patch.object(os, 'replace', editor_saves_then_rename):
+            with self.assertRaisesRegex(ValueError, 'restored'):
+                linter.generate_moc(self.vault)
+        self.assertIn('Window edit', target.read_text(encoding='utf-8'))
+        self.assertEqual([p.name for p in target.parent.iterdir() if p.name.startswith('.serobeyinn')], [])
+
+    @unittest.skipIf(os.name == 'nt', 'Windows cannot rename over an open file; only the pre-rename check applies')
+    def test_moc_waits_for_a_truncating_save_before_restoring(self):
+        # The editor truncated the file inside the replace window and writes a moment later:
+        # restoring the empty read would blank the user's note.
+        target = self._owned_moc()
+        saved = ('Handwritten text\n' + linter.MOC_START_MARKER + '\nold\n' + linter.MOC_END_MARKER
+                 + '\nKaydedilen yeni satır\n').encode('utf-8')
+        original_replace = os.replace
+        editor = {}
+        def editor_truncates_then_rename(source, destination, *args, **kwargs):
+            if Path(destination).resolve() == target.resolve() and not editor:
+                editor['handle'] = open(target, 'r+b')
+                editor['handle'].truncate(0)
+            return original_replace(source, destination, *args, **kwargs)
+        def editor_finishes_write(seconds):
+            handle = editor.get('handle')
+            if handle is not None and not handle.closed:
+                handle.write(saved)
+                handle.close()
+        with patch.object(os, 'replace', editor_truncates_then_rename), \
+                patch.object(time, 'sleep', editor_finishes_write):
+            with self.assertRaisesRegex(ValueError, 'restored'):
+                linter.generate_moc(self.vault)
+        self.assertEqual(target.read_bytes(), saved)
+
+    def test_moc_never_rewrites_a_file_without_one_marker_pair(self):
+        (self.vault / 'knowledge').mkdir()
+        (self.vault / 'knowledge/a.md').write_text('# A', encoding='utf-8')
+        target = self.vault / 'knowledge/MOC.md'
+        start, end = linter.MOC_START_MARKER, linter.MOC_END_MARKER
+        for text in ('# Elle yazılmış harita\n- [[a]]\n',
+                     f'{start}\nx\n{end}\n{start}\ny\n{end}\n',
+                     f'{end}\nters\n{start}\n'):
+            with self.subTest(text=text):
+                target.write_text(text, encoding='utf-8')
+                before = target.read_bytes()
+                with self.assertRaisesRegex(ValueError, 'pair'):
+                    linter.generate_moc(self.vault)
+                self.assertEqual(target.read_bytes(), before)
+
+    def test_moc_without_changes_does_not_touch_the_file(self):
+        target = self._owned_moc()
+        self.assertEqual(linter.generate_moc(self.vault)['status'], 'updated')
+        before = os.stat(target)
+        self.assertEqual(linter.generate_moc(self.vault)['status'], 'unchanged')
+        after = os.stat(target)
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+
+    def test_moc_keeps_bom_and_crlf_outside_the_block(self):
+        target = self._owned_moc()
+        head = '\ufeff# Başlık\r\nKullanıcı metni\r\n'.encode('utf-8')
+        tail = '\r\nSon satır\r\n'.encode('utf-8')
+        block = (linter.MOC_START_MARKER + '\r\nold\r\n' + linter.MOC_END_MARKER).encode('utf-8')
+        target.write_bytes(head + block + tail)
+        linter.generate_moc(self.vault)
+        data = target.read_bytes()
+        self.assertTrue(data.startswith(head))
+        self.assertTrue(data.endswith(tail))
+        self.assertIn(b'knowledge/a.md', data)
+        self.assertNotIn(b'\n', data.replace(b'\r\n', b''))
+
+    def test_moc_file_is_a_plain_markdown_name_in_a_regular_folder(self):
+        (self.vault / 'knowledge').mkdir()
+        (self.vault / 'projects/app').mkdir(parents=True)
+        rules = self.vault / 'projects/app/Kurallar.md'
+        rules.write_text('# Kurallar\n', encoding='utf-8')
+        for name in ('../projects/app/Kurallar.md', 'sub/MOC.md', 'MOC.txt', '.MOC.md', ' MOC.md'):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    linter.generate_moc(self.vault, 'knowledge', name)
+        # Instruction, companion and rule file names are refused even where none exists yet.
+        for name in ('CLAUDE.md', 'agents.md', 'GEMINI.md', 'Kurallar.md', 'rules.md', 'Soul.md', 'setup-ek.md'):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, 'reserved'):
+                    linter.generate_moc(self.vault, 'projects/app' if name == 'Kurallar.md' else 'knowledge', name)
+        self.assertEqual(sorted(path.name for path in (self.vault / 'knowledge').iterdir()), [])
+        (self.vault / '.claude').mkdir()
+        with self.assertRaises(ValueError):
+            linter.generate_moc(self.vault, '.claude')
+        self.assertEqual(rules.read_text(encoding='utf-8'), '# Kurallar\n')
+        self.assertFalse((self.vault / '.claude/MOC.md').exists())
+
+    def test_moc_link_titles_cannot_break_wikilinks(self):
+        (self.vault / 'knowledge').mkdir()
+        (self.vault / 'knowledge/plan.md').write_text('# [Taslak] Plan | v2 ]]\n', encoding='utf-8')
+        linter.generate_moc(self.vault)
+        links = linter.extract_wikilinks((self.vault / 'knowledge/MOC.md').read_text(encoding='utf-8'))
+        self.assertEqual([(link['file_target'], link['display']) for link in links],
+                         [('knowledge/plan.md', 'Taslak Plan v2')])
+
+    def test_heading_link_needs_the_heading_on_one_line(self):
+        (self.vault / 'b.md').write_text('#\nMissing\n## Var Olan\n', encoding='utf-8')
+        (self.vault / 'a.md').write_text('[[b#Missing]] [[b#Var Olan]]', encoding='utf-8')
+        result = linter.lint_vault(self.vault)
+        self.assertEqual([link['raw'] for link in result['broken_links']], ['[[b#Missing]]'])
+
+    def test_turkish_uppercase_archive_folder_is_skipped(self):
+        for source in ('knowledge/ARŞİV/eski.md', 'knowledge/Arşiv/eski2.md', 'knowledge/güncel.md'):
+            path = self.vault / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('# ' + Path(source).stem, encoding='utf-8')
+        linter.generate_moc(self.vault)
+        text = (self.vault / 'knowledge/MOC.md').read_text(encoding='utf-8')
+        self.assertIn('güncel', text)
+        self.assertNotIn('eski', text)
+
+    def test_official_template_archive_folder_is_skipped(self):
+        for source, text in (('📦 900-Archive/eski/x.md', '# Eski\n[[yok-olan]]\n'),
+                             ('2024_Arşivler/y.md', '# Eski2\n[[yok-olan]]\n'),
+                             ('knowledge/archive-araçları.md', '# Araç notu\n'),
+                             ('knowledge/a.md', '# A\n[[archive-araçları]]\n')):
+            path = self.vault / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+        result = linter.lint_vault(self.vault)
+        self.assertEqual((result['status'], result['scanned_files_count']), ('ok', 2))
+        linter.generate_moc(self.vault, '.', 'Harita.md')
+        text = (self.vault / 'Harita.md').read_text(encoding='utf-8')
+        self.assertIn('Araç notu', text)
+        self.assertNotIn('Eski', text)
+
+    def test_moc_headings_keep_turkish_letters(self):
+        for source in ('knowledge/iş-planı/a.md', 'knowledge/KİŞİSEL/b.md'):
+            path = self.vault / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('# Not\n', encoding='utf-8')
+        linter.generate_moc(self.vault, 'knowledge/iş-planı', 'Harita.md')
+        self.assertTrue((self.vault / 'knowledge/iş-planı/Harita.md').read_text(encoding='utf-8')
+                        .startswith('# Knowledge/iş planı '))
+        linter.generate_moc(self.vault)
+        headings = [line for line in (self.vault / 'knowledge/MOC.md').read_text(encoding='utf-8').splitlines()
+                    if line.startswith('### ')]
+        self.assertEqual(headings, ['### KİŞİSEL', '### İş planı'])
+
+    def test_lint_lists_are_bounded_but_counts_are_complete(self):
+        for index in range(linter.LINT_REPORT_LIMIT + 5):
+            (self.vault / f'n{index:03}.md').write_text(f'# {index}\n[[{"y" * 400}{index}]]\n', encoding='utf-8')
+        result = linter.lint_vault(self.vault)
+        self.assertEqual((result['orphan_count'], result['broken_links_count']),
+                         (linter.LINT_REPORT_LIMIT + 5, linter.LINT_REPORT_LIMIT + 5))
+        self.assertEqual(len(result['orphans']), linter.LINT_REPORT_LIMIT)
+        self.assertEqual(len(result['broken_links']), linter.LINT_REPORT_LIMIT)
+        self.assertEqual(result['truncated'], {'broken_links': 5, 'orphans': 5})
+        self.assertTrue(all(len(link['raw']) <= linter.MAX_RAW_LINK_CHARS for link in result['broken_links']))
+
+    def test_lint_folder_counts_include_findings_beyond_list_limit(self):
+        for index in range(105):
+            path = self.vault / 'capture' / f'n{index:03}.md'
+            path.parent.mkdir(exist_ok=True)
+            path.write_text('# Card\n[[missing]]\n', encoding='utf-8')
+        (self.vault / 'knowledge').mkdir()
+        (self.vault / 'knowledge/a.md').write_text('# A\n[[b]]', encoding='utf-8')
+        (self.vault / 'knowledge/b.md').write_text('# B', encoding='utf-8')
+        (self.vault / 'root.md').write_text('# Root', encoding='utf-8')
+        (self.vault / 'secret.md').write_text('---\nvisibility: private\n---\n[[hidden]]', encoding='utf-8')
+        report = linter.lint_vault(self.vault)
+        self.assertEqual(report['folder_counts'], [
+            {'folder': 'capture', 'broken_links': 105, 'orphans': 105, 'unlinked': 0},
+            {'folder': '.', 'broken_links': 0, 'orphans': 1, 'unlinked': 0},
+            {'folder': 'knowledge', 'broken_links': 0, 'orphans': 0, 'unlinked': 1},
+        ])
+        for category, count in (('broken_links', 'broken_links_count'), ('orphans', 'orphan_count'),
+                                ('unlinked', 'unlinked_count')):
+            self.assertEqual(sum(row[category] for row in report['folder_counts']), report[count])
+        scoped = linter.lint_vault(self.vault, 'knowledge')
+        self.assertEqual(scoped['folder_counts'], [
+            {'folder': 'knowledge', 'broken_links': 0, 'orphans': 0, 'unlinked': 1}])
+
+    def test_lint_folder_counts_are_bounded_and_remainder_is_exact(self):
+        for index in range(105):
+            path = self.vault / f'f{index:03}' / 'note.md'
+            path.parent.mkdir()
+            path.write_text('# Note\n[[missing]]', encoding='utf-8')
+        report = linter.lint_vault(self.vault)
+        self.assertEqual(len(report['folder_counts']), 100)
+        self.assertEqual(report['folder_counts'][0]['folder'], 'f000')
+        self.assertEqual(report['folder_counts'][-1]['folder'], 'f099')
+        self.assertEqual(report['folder_counts_remaining'],
+                         {'folders': 5, 'broken_links': 5, 'orphans': 5, 'unlinked': 0})
+
+    def test_installed_lint_returns_folder_counts(self):
+        from v3_package_helpers import install, isolated_env
+        env = isolated_env(Path(self.tmp.name) / 'home')
+        proc = install(self.vault, self.state, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', errors='replace'))
+        target = self.vault / 'knowledge/summary-fixture'
+        target.mkdir(parents=True, exist_ok=True)
+        (target / 'note.md').write_text('# Note\n[[missing]]\n[[also-missing]]', encoding='utf-8')
+        proc = subprocess.run([sys.executable, str(self.vault / 'serobeyinn.py'),
+                               '--json', 'lint', '--folder', 'knowledge/summary-fixture'],
+                              env=env, capture_output=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', errors='replace'))
+        report = json.loads(proc.stdout)
+        self.assertEqual(report['folder_counts'], [
+            {'folder': 'knowledge/summary-fixture', 'broken_links': 2, 'orphans': 1, 'unlinked': 0}])
+        self.assertNotIn('folder_counts_remaining', report)
+
+    def test_wikilink_scan_stays_linear_on_adversarial_lines(self):
+        import time
+        for line in ('[[' + 'a' * 200000, '[[a' * 70000, '[[' + 'a|' * 100000, '![[' * 70000):
+            started = time.monotonic()
+            linter.extract_wikilinks(line + '\n' + line)
+            self.assertLess(time.monotonic() - started, 5)
+
+    def _lint_cli(self, *args):
+        report, code = cli.main(['--vault', str(self.vault), '--state', str(self.state),
+                                 'lint', *args], return_result=True)
+        self.assertEqual(code, 0, report)
+        return report
+
+    def test_cli_lint_index_exclusions_preserve_graph_and_moc(self):
+        from v3_package_helpers import snapshot
+        self._write_notes(self.vault, {
+            'capture/orphan.md': '# Orphan\n',
+            'capture/source.md': '[[knowledge/target]] [[missing]]\n',
+            'capture/target.md': '# Present\n',
+            'capture/private.md': '---\nvisibility: private\n---\n# PrivateCanary\n',
+            'knowledge/target.md': '# Target\n',
+            'knowledge/source.md': '[[capture/target#Present]] [[capture/target#Absent]] '
+                                   '[[capture/private]]\n',
+            'daily/v3/day.md': '# Generated control\n',
+            'knowledge/v3/outcomes.md': '# Generated control\n',
+        })
+        before = self._lint_cli()
+        (self.state / 'index.json').write_text('{"excluded_dirs": ["capture"]}', encoding='utf-8')
+        unchanged = snapshot(Path(self.tmp.name))
+        after = self._lint_cli()
+        self.assertEqual(snapshot(Path(self.tmp.name)), unchanged)
+        for key in ('status', 'scanned_files_count', 'total_links_count',
+                    'broken_links_count', 'broken_links'):
+            self.assertEqual(after[key], before[key], key)
+        self.assertEqual(after['scanned_files_count'], 7)
+        self.assertEqual(after['total_links_count'], 5)
+        self.assertEqual(after['broken_links_count'], 2)
+        self.assertEqual(after['withheld_targets_count'], 1)
+        self.assertEqual(after['orphans'], [])
+        self.assertEqual(after['unlinked'], ['knowledge/source.md'])
+        self.assertEqual((before['orphan_count'], after['orphan_count']), (1, 0))
+        self.assertEqual((before['unlinked_count'], after['unlinked_count']), (2, 1))
+        scoped = self._lint_cli('--folder', 'capture')
+        self.assertEqual((scoped['scanned_files_count'], scoped['total_links_count'],
+                          scoped['broken_links_count'], scoped['orphan_count'], scoped['unlinked_count']),
+                         (3, 2, 1, 0, 0))
+        self.assertEqual(scoped['folder_counts'], [
+            {'folder': 'capture', 'broken_links': 1, 'orphans': 0, 'unlinked': 0}])
+        self.assertNotIn('knowledge/target.md', self._lint_cli('--folder', 'knowledge')['orphans'])
+        base = ['--vault', str(self.vault), '--state', str(self.state), 'moc', '--folder', 'capture']
+        result, code = cli.main(base, return_result=True)
+        self.assertEqual((code, result['indexed_notes_count']), (0, 3))
+        moc = (self.vault / 'capture/MOC.md').read_bytes()
+        self.assertIn(b'capture/orphan.md', moc)
+        self.assertNotIn(b'PrivateCanary', moc)
+        (self.state / 'index.json').unlink()
+        result, code = cli.main(base, return_result=True)
+        self.assertEqual((code, result['status']), (0, 'unchanged'))
+        self.assertEqual((self.vault / 'capture/MOC.md').read_bytes(), moc)
+
+    def test_cli_lint_index_exclusions_match_directory_names_at_any_depth(self):
+        self._write_notes(self.vault, {
+            'capture/a.md': '# A', 'projects/CAPTURE/b.md': '# B',
+            'projects/KİŞİSEL/c.md': '# C', 'projects/Cafe\u0301/d.md': '# D',
+            'capture-more/e.md': '# E', 'capture.md': '# Root name',
+        })
+        (self.state / 'index.json').write_text(
+            json.dumps({'excluded_dirs': ['Capture', 'kişisel', 'Café']}), encoding='utf-8')
+        report = self._lint_cli()
+        self.assertEqual(report['scanned_files_count'], 6)
+        self.assertEqual(report['orphans'], ['capture-more/e.md', 'capture.md'])
+        self.assertEqual(report['orphan_count'], 2)
+
+    def test_cli_lint_missing_invalid_and_builtin_exclusions_keep_report(self):
+        from v3_package_helpers import snapshot
+        self._write_notes(self.vault, {'capture/a.md': '# A', 'b.md': '[[capture/a]]'})
+        before = self._lint_cli()
+        for value in ('{', '{"excluded_dirs": ["capture", "projects/capture"]}',
+                      '{"excluded_dirs": ["capture", "knowledge"]}',
+                      '{"excluded_dirs": ["receipts", "node_modules", ".hidden"]}'):
+            with self.subTest(config=value):
+                (self.state / 'index.json').write_text(value, encoding='utf-8')
+                unchanged = snapshot(Path(self.tmp.name))
+                self.assertEqual(self._lint_cli(), before)
+                self.assertEqual(snapshot(Path(self.tmp.name)), unchanged)
+        (self.state / 'index.json').unlink()
+        self.state.rmdir()
+        self.assertEqual(self._lint_cli(), before)
+        self.assertFalse(self.state.exists())
+
+    def test_cli_lint_index_exclusions_precede_report_limits(self):
+        for folder, count in (('capture', 105), ('kept', 101)):
+            self._write_notes(self.vault, {
+                f'{folder}/n{index:03}.md': '# Note\n[[missing]]' for index in range(count)})
+        (self.state / 'index.json').write_text('{"excluded_dirs": ["capture"]}', encoding='utf-8')
+        report = self._lint_cli()
+        self.assertEqual((report['scanned_files_count'], report['total_links_count'],
+                          report['broken_links_count'], report['orphan_count']), (206, 206, 206, 101))
+        self.assertEqual(report['orphans'], [f'kept/n{index:03}.md' for index in range(100)])
+        self.assertEqual(report['truncated'], {'broken_links': 106, 'orphans': 1})
+        self.assertEqual(report['folder_counts'], [
+            {'folder': 'kept', 'broken_links': 101, 'orphans': 101, 'unlinked': 0},
+            {'folder': 'capture', 'broken_links': 105, 'orphans': 0, 'unlinked': 0},
+        ])
+
+    def test_installed_lint_uses_selected_state_exclusions(self):
+        from v3_package_helpers import install, isolated_env, snapshot
+        env = isolated_env(Path(self.tmp.name) / 'home')
+        proc = install(self.vault, self.state, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', errors='replace'))
+        self._write_notes(self.vault, {
+            'capture/a.md': '# A', 'capture/b.md': '[[knowledge/target]]',
+            'knowledge/target.md': '# Target',
+        })
+        command = [sys.executable, str(self.vault / 'serobeyinn.py'), '--json']
+        proc = subprocess.run(command + ['preferences', '--index-exclude-dir', 'capture'],
+                              env=env, capture_output=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', errors='replace'))
+        unchanged = snapshot(Path(self.tmp.name))
+        for state_args, expected in (([], (0, 0)),
+                                     (['--state', str(Path(self.tmp.name) / 'other-state')], (1, 1))):
+            with self.subTest(state_args=state_args):
+                proc = subprocess.run(command + state_args + ['lint', '--folder', 'capture'],
+                                      env=env, capture_output=True, timeout=30)
+                self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', errors='replace'))
+                report = json.loads(proc.stdout)
+                self.assertEqual((report['scanned_files_count'], report['total_links_count'],
+                                  report['broken_links_count']), (2, 1, 0))
+                self.assertEqual((report['orphan_count'], report['unlinked_count']), expected)
+        self.assertEqual(snapshot(Path(self.tmp.name)), unchanged)
+
+    def test_moc_omits_sensitive_archived_and_private_notes(self):
+        for source, text in [('knowledge/public.md', '# Public'),
+                             ('knowledge/secrets/secret.md', '# SecretCanary'),
+                             ('knowledge/Arşiv/old.md', '# ArchiveCanary'),
+                             ('knowledge/private-note.md', '---\nvisibility: private\n---\n# PrivateCanary')]:
+            path = self.vault / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+        linter.generate_moc(self.vault)
+        result = (self.vault / 'knowledge/MOC.md').read_text()
+        self.assertIn('Public', result)
+        self.assertNotIn('Canary', result)
+
+    def _write_notes(self, vault, notes):
+        for source, text in notes.items():
+            path = vault / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+
+    def test_moc_never_copies_another_projects_titles_into_a_scoped_context(self):
+        # Nested scopes: a MOC over knowledge/ must not carry knowledge/acme titles into a file
+        # that another project's explicit context query receives (with and without shared_unscoped).
+        notes = {'knowledge/acme/teklif.md': '---\ntitle: Acme birleşme teklifi 42 milyon\n---\nAcme birleşme teklifi gizli.\n',
+                 'knowledge/beta/plan.md': '# Beta plan\nBeta birleşme teklifi planı.\n',
+                 'knowledge/genel/g.md': '# Genel birleşme teklifi rehberi\nGenel birleşme teklifi notu.\n'}
+        cases = (({'knowledge/acme': 'acme', 'knowledge/beta': 'beta'}, True, 'beta', 2,
+                  ['knowledge/genel/g.md']),
+                 ({'knowledge': 'general', 'knowledge/acme': 'acme'}, False, 'general', 1,
+                  ['knowledge/beta/plan.md', 'knowledge/genel/g.md']))
+        for index, (folders, shared, reader, other, listed) in enumerate(cases):
+            with self.subTest(shared=shared):
+                vault, state = Path(self.tmp.name) / f'scoped{index}', Path(self.tmp.name) / f'state{index}'
+                vault.mkdir()
+                state.mkdir()
+                self._write_notes(vault, notes)
+                (vault / runtime.PROJECT_SCOPES_FILE).write_text(
+                    json.dumps({'folders': folders, 'shared_unscoped': shared}), encoding='utf-8')
+                result = linter.generate_moc(vault)
+                text = (vault / 'knowledge/MOC.md').read_text(encoding='utf-8')
+                self.assertNotIn('Acme', text)
+                self.assertEqual(sorted(link['file_target'] for link in linter.extract_wikilinks(text)), listed)
+                self.assertEqual((result['status'], result['skipped']['other_scope']), ('created', other))
+                # The acme MOC lists acme's own note and belongs to acme's scope only.
+                linter.generate_moc(vault, 'knowledge/acme')
+                self.assertIn('Acme birleşme teklifi 42 milyon',
+                              (vault / 'knowledge/acme/MOC.md').read_text(encoding='utf-8'))
+                answer, code = cli.main(['--vault', str(vault), '--state', str(state), 'context',
+                                         '--project', reader, 'Acme birleşme teklifi'], return_result=True)
+                self.assertEqual(code, 0, answer)
+                self.assertTrue(answer['records'])
+                self.assertNotIn('Acme birleşme', json.dumps(answer, ensure_ascii=False))
+
+    def test_moc_follows_project_fields_visibility_and_trust(self):
+        long_title = 'Uzun başlık ' * 40
+        self._write_notes(self.vault, {
+            'knowledge/a.md': '---\nproject: acme\n---\n# AcmeCanary\n',
+            'knowledge/b.md': '# Ortak not\n',
+            'knowledge/c.md': '---\nvisibility: public\n---\n# Açık not\n',
+            'knowledge/d.md': '---\ntrust: untrusted\n---\n# UntrustedCanary\n',
+            'knowledge/e.md': '---\nkind: preference\nstatus: rejected\n---\n# RejectedCanary\n',
+            'knowledge/f.md': f'# {long_title}\n'})
+        # No scope file: a project field alone decides, exactly as retrieval does.
+        result = linter.generate_moc(self.vault)
+        text = (self.vault / 'knowledge/MOC.md').read_text(encoding='utf-8')
+        self.assertIn('Ortak not', text)
+        self.assertIn('Açık not', text)
+        self.assertNotIn('Canary', text)
+        self.assertEqual(result['skipped'], {'other_scope': 1, 'narrower_visibility': 0, 'untrusted': 2})
+        self.assertTrue(all(len(link['display']) <= linter.MAX_MOC_TITLE_CHARS + 1
+                            for link in linter.extract_wikilinks(text)))
+        start, end = linter.MOC_START_MARKER, linter.MOC_END_MARKER
+        # A public MOC lists only public notes; an acme MOC lists only acme's notes.
+        (self.vault / 'knowledge/Herkese.md').write_text(f'---\nvisibility: public\n---\n{start}\n{end}\n', encoding='utf-8')
+        linter.generate_moc(self.vault, 'knowledge', 'Herkese.md')
+        text = (self.vault / 'knowledge/Herkese.md').read_text(encoding='utf-8')
+        self.assertIn('Açık not', text)
+        self.assertNotIn('Ortak not', text)
+        (self.vault / 'knowledge/Acme.md').write_text(f'---\nproject: acme\n---\n{start}\n{end}\n', encoding='utf-8')
+        result = linter.generate_moc(self.vault, 'knowledge', 'Acme.md')
+        text = (self.vault / 'knowledge/Acme.md').read_text(encoding='utf-8')
+        self.assertEqual(result['moc_scope'], 'acme')
+        self.assertIn('AcmeCanary', text)
+        self.assertNotIn('Ortak not', text)
+
+    def test_relative_links_and_missing_qualified_paths(self):
+        for source in ['a/note.md', 'b/note.md', 'b/sub/source.md']:
+            path = self.vault / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('# Present', encoding='utf-8')
+        result = linter.resolve_wikilink(self.vault, '../note', source_file='b/sub/source.md')
+        self.assertEqual(result['resolved_path'], 'b/note.md')
+        self.assertFalse(linter.resolve_wikilink(self.vault, 'missing/note')['exists'])
+
+    def test_root_relative_and_partial_path_links_resolve_like_obsidian(self):
+        for source, text in [('note.md', '# N'), ('a.md', '[[./note]]'),
+                             ('knowledge/kavramlar/temel.md', '# T'), ('p/x.md', '[[kavramlar/temel]]'),
+                             ('b/sub/source.md', '[[./note]] [[missing/temel]]')]:
+            path = self.vault / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+        result = linter.lint_vault(self.vault)
+        self.assertEqual(sorted((link['source'], link['raw']) for link in result['broken_links']),
+                         [('b/sub/source.md', '[[./note]]'), ('b/sub/source.md', '[[missing/temel]]')])
+        self.assertNotIn('a.md', result['orphans'])
+        self.assertNotIn('knowledge/kavramlar/temel.md', result['orphans'])
+
+    def test_attachments_resolve_by_name_and_dotted_note_names_stay_notes(self):
+        for source, text in [('notlar/rapor.md', '![[diyagram.png]] [[belge.pdf]] ![[yok.png]] [[Sürüm v1.2]] '
+                                                  '![[../ekler/diyagram.png]] [[diagram.png]]'),
+                             ('notlar/Sürüm v1.2.md', '# Sürüm'), ('notlar/Sürüm v1.md', '# Eski'),
+                             ('diagram.md', '# Not, resim değil')]:
+            path = self.vault / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+        for attachment in ('ekler/diyagram.png', 'dosyalar/belge.pdf', 'gizli/diagram.png'):
+            path = self.vault / attachment
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'\x89PNG')
+        result = linter.lint_vault(self.vault)
+        self.assertEqual(sorted(link['raw'] for link in result['broken_links']),
+                         ['![[yok.png]]', '[[diagram.png]]'])
+        self.assertNotIn('notlar/Sürüm v1.2.md', result['orphans'])
+        self.assertIn('notlar/Sürüm v1.md', result['orphans'])
+        self.assertIn('diagram.md', result['orphans'])
+
+    def test_lint_folder_must_exist_inside_the_vault(self):
+        (self.vault / 'knowledge').mkdir()
+        for folder in ('knowlege', '..', '../elsewhere'):
+            with self.subTest(folder=folder):
+                with self.assertRaisesRegex(ValueError, 'not found'):
+                    linter.lint_vault(self.vault, folder)
+        self.assertEqual(linter.lint_vault(self.vault, 'knowledge/')['scanned_files_count'], 0)
+        (self.vault / 'knowledge/a.md').write_text('# A', encoding='utf-8')
+        self.assertEqual(linter.lint_vault(self.vault, 'knowledge/../knowledge')['scanned_files_count'], 1)
+
+    def test_links_and_headings_inside_code_are_ignored(self):
+        (self.vault / 'script.md').write_text('# Kurulum\n```bash\n# Install\nif [[ -f x ]]; then echo; fi\n```\n',
+                                              encoding='utf-8')
+        (self.vault / 'a.md').write_text('Kod `[[ -n "$x" ]]` ve [[script#Kurulum]] ama [[script#Install]]\n'
+                                         '~~~\n[[yok]]\n~~~\n', encoding='utf-8')
+        result = linter.lint_vault(self.vault)
+        self.assertEqual([link['raw'] for link in result['broken_links']], ['[[script#Install]]'])
+        self.assertEqual(result['total_links_count'], 2)
+
+    def test_folder_lint_counts_external_backlinks_and_missing_embeds(self):
+        (self.vault / 'knowledge').mkdir()
+        (self.vault / 'knowledge/a.md').write_text('# Present\n![[missing]]\n[[#Absent]]', encoding='utf-8')
+        (self.vault / 'outside.md').write_text('[[knowledge/a]]', encoding='utf-8')
+        result = linter.lint_vault(self.vault, 'knowledge')
+        self.assertEqual(result['broken_links_count'], 2)
+        self.assertNotIn('knowledge/a.md', result['orphans'])
+
+    def test_moc_rejects_escape_and_preserves_external_file(self):
+        (self.vault / 'knowledge').mkdir()
+        outside = self.vault.parent / 'outside.md'
+        outside.write_text('User text', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            linter.generate_moc(self.vault, 'knowledge', '../../outside.md')
+        self.assertEqual(outside.read_text(), 'User text')
+
+    def test_moc_update_preserves_backslashes_in_titles(self):
+        (self.vault / 'knowledge').mkdir()
+        (self.vault / 'knowledge/note.md').write_text('# C:\\Users\\Synthetic\n', encoding='utf-8')
+        linter.generate_moc(self.vault)
+        before = (self.vault / 'knowledge/MOC.md').read_text()
+        linter.generate_moc(self.vault)
+        self.assertEqual((self.vault / 'knowledge/MOC.md').read_text(), before)
+
+    def test_extract_wikilinks(self):
+        sample_text = """
+# System Overview
+This note links to [[Architecture]] and also [[Architecture|System Architecture]].
+Here is an anchor link [[Architecture#Database]] and [[Architecture#Database|DB Schema]].
+Here is an internal heading link: [[#Summary]].
+Here is an embedded image: ![[diagram.png]].
+And another link on line 8: [[Components/Auth]].
+"""
+        links = linter.extract_wikilinks(sample_text)
+        self.assertEqual(len(links), 7)
+
+        # 1. [[Architecture]]
+        self.assertEqual(links[0]["file_target"], "Architecture")
+        self.assertIsNone(links[0]["display"])
+        self.assertIsNone(links[0]["heading"])
+        self.assertFalse(links[0]["is_embed"])
+        self.assertEqual(links[0]["line"], 3)
+
+        # 2. [[Architecture|System Architecture]]
+        self.assertEqual(links[1]["file_target"], "Architecture")
+        self.assertEqual(links[1]["display"], "System Architecture")
+
+        # 3. [[Architecture#Database]]
+        self.assertEqual(links[2]["file_target"], "Architecture")
+        self.assertEqual(links[2]["heading"], "Database")
+
+        # 4. [[Architecture#Database|DB Schema]]
+        self.assertEqual(links[3]["file_target"], "Architecture")
+        self.assertEqual(links[3]["heading"], "Database")
+        self.assertEqual(links[3]["display"], "DB Schema")
+
+        # 5. [[#Summary]]
+        self.assertEqual(links[4]["file_target"], "")
+        self.assertEqual(links[4]["heading"], "Summary")
+
+        # 6. ![[diagram.png]]
+        self.assertEqual(links[5]["file_target"], "diagram.png")
+        self.assertTrue(links[5]["is_embed"])
+
+        # 7. [[Components/Auth]]
+        self.assertEqual(links[6]["file_target"], "Components/Auth")
+        self.assertEqual(links[6]["line"], 7)
+
+    def test_resolve_wikilink(self):
+        # Setup notes
+        (self.vault / "knowledge/concepts").mkdir(parents=True)
+        (self.vault / "knowledge/concepts/clean-code.md").write_text("# Clean Code", encoding="utf-8")
+        (self.vault / "projects/app").mkdir(parents=True)
+        (self.vault / "projects/app/main.md").write_text("# Main App", encoding="utf-8")
+        (self.vault / "projects/app/local-note.md").write_text("# Local", encoding="utf-8")
+
+        index = linter.build_vault_index(self.vault)
+
+        # 1. Exact path
+        res_exact = linter.resolve_wikilink(self.vault, "knowledge/concepts/clean-code.md", vault_index=index)
+        self.assertTrue(res_exact["exists"])
+        self.assertEqual(res_exact["resolved_path"], "knowledge/concepts/clean-code.md")
+
+        # 2. Exact path without extension
+        res_no_ext = linter.resolve_wikilink(self.vault, "knowledge/concepts/clean-code", vault_index=index)
+        self.assertTrue(res_no_ext["exists"])
+        self.assertEqual(res_no_ext["resolved_path"], "knowledge/concepts/clean-code.md")
+
+        # 3. Parent-relative path
+        res_rel = linter.resolve_wikilink(self.vault, "local-note", source_file="projects/app/main.md", vault_index=index)
+        self.assertTrue(res_rel["exists"])
+        self.assertEqual(res_rel["resolved_path"], "projects/app/local-note.md")
+
+        # 4. Basename shortest path lookup
+        res_basename = linter.resolve_wikilink(self.vault, "clean-code", vault_index=index)
+        self.assertTrue(res_basename["exists"])
+        self.assertEqual(res_basename["resolved_path"], "knowledge/concepts/clean-code.md")
+
+        # 5. Nonexistent
+        res_missing = linter.resolve_wikilink(self.vault, "nonexistent-doc", vault_index=index)
+        self.assertFalse(res_missing["exists"])
+        self.assertIsNone(res_missing["resolved_path"])
+
+    def test_lint_vault_broken_links_and_orphans(self):
+        # Setup notes
+        (self.vault / "knowledge").mkdir(parents=True)
+        (self.vault / "knowledge/note-a.md").write_text("# Note A\nLinks to [[note-b]].", encoding="utf-8")
+        (self.vault / "knowledge/note-b.md").write_text("# Note B\nLinks to [[broken-target]].", encoding="utf-8")
+        (self.vault / "knowledge/orphan.md").write_text("# Orphan Note\nNo links at all.", encoding="utf-8")
+        (self.vault / "knowledge/unlinked.md").write_text("# Unlinked\nLinks to [[note-a]], but nobody links to it.", encoding="utf-8")
+
+        report = linter.lint_vault(self.vault)
+        self.assertEqual(report["status"], "issues_found")
+        self.assertEqual(report["broken_links_count"], 1)
+        self.assertEqual(report["broken_links"][0]["target"], "broken-target")
+        self.assertEqual(report["broken_links"][0]["source"], "knowledge/note-b.md")
+        self.assertEqual(report["broken_links"][0]["line"], 2)
+
+        self.assertIn("knowledge/orphan.md", report["orphans"])
+        self.assertIn("knowledge/unlinked.md", report["unlinked"])
+
+    def test_lint_resolves_exact_receipt_links_without_scanning_receipts(self):
+        # Generated daily and outcomes views link every entry as [[receipts/<sha256>.md]];
+        # receipts stay outside the scan, yet an existing one is not a broken link.
+        name = "a" * 64 + ".md"
+        (self.vault / "receipts").mkdir()
+        (self.vault / "receipts" / name).write_text("# Receipt\n", encoding="utf-8")
+        (self.vault / "daily").mkdir()
+        (self.vault / "daily/2026-01-02.md").write_text(
+            "# Day\n[[receipts/" + name + "]]\n[[receipts/" + "b" * 64 + ".md]]\n[[" + "a" * 64 + "]]\n",
+            encoding="utf-8")
+
+        report = linter.lint_vault(self.vault)
+        self.assertEqual(report["scanned_files_count"], 1)
+        self.assertEqual(sorted(link["target"] for link in report["broken_links"]),
+                         ["a" * 64, "receipts/" + "b" * 64 + ".md"])
+        self.assertEqual(report["status"], "issues_found")
+        self.assertEqual(report["broken_links_count"], 2)
+        self.assertEqual(report["withheld_targets_count"], 0)
+        self.assertNotIn("receipts/" + name, report["orphans"] + report["unlinked"])
+        self.assertNotIn("daily/2026-01-02.md", report["orphans"])
+
+    def test_receipt_fragments_never_read_receipt_bodies(self):
+        name = 'a' * 64 + '.md'
+        (self.vault / 'receipts').mkdir()
+        receipt = self.vault / 'receipts' / name
+        receipt.write_text('# Private marker\nDO_NOT_READ', encoding='utf-8')
+        (self.vault / 'knowledge').mkdir()
+        (self.vault / 'knowledge/day.md').write_text(
+            '[[receipts/' + name + '#Private marker]]\n[[receipts/' + name + '#Missing marker]]',
+            encoding='utf-8')
+        original = Path.read_text
+        def read(path, *args, **kwargs):
+            self.assertNotEqual(path, receipt, 'receipt bodies must not be read for heading validation')
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', read):
+            report = linter.lint_vault(self.vault)
+        self.assertEqual(report['status'], 'ok')
+        self.assertEqual(report['broken_links_count'], 0)
+        self.assertEqual(report['scanned_files_count'], 1)
+        self.assertNotIn('DO_NOT_READ', json.dumps(report))
+
+    def test_lint_finds_no_broken_links_in_engine_written_receipt_views(self):
+        (self.vault / "knowledge").mkdir()
+        (self.vault / "knowledge/note.md").write_text("# Note\n", encoding="utf-8")
+        base = ["--vault", str(self.vault), "--state", str(self.state)]
+        _, code = cli.main(base + ["receipt", "--harness", "claude", "--event-id", "lint-receipt-view",
+                                   "--summary", "Lint receipt link check.", "--ref", "knowledge/note.md"],
+                           return_result=True)
+        self.assertEqual(code, 0)
+        _, code = cli.main(base + ["sync"], return_result=True)
+        self.assertEqual(code, 0)
+        views = [path for path in self.vault.rglob("*.md")
+                 if "receipts" not in path.relative_to(self.vault).parts
+                 and "[[receipts/" in path.read_text(encoding="utf-8")]
+        self.assertTrue(views, "sync wrote no view linking a receipt")
+
+        report = linter.lint_vault(self.vault)
+        self.assertEqual([link for link in report["broken_links"] if link["target"].startswith("receipts/")], [])
+
+    def test_lint_vault_clean_pass(self):
+        (self.vault / "knowledge").mkdir(parents=True)
+        (self.vault / "knowledge/alpha.md").write_text("# Alpha\nLinks to [[beta]].", encoding="utf-8")
+        (self.vault / "knowledge/beta.md").write_text("# Beta\nLinks to [[alpha]].", encoding="utf-8")
+
+        report = linter.lint_vault(self.vault)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["broken_links_count"], 0)
+        self.assertEqual(report["orphan_count"], 0)
+
+    def test_generate_moc_fresh_creation(self):
+        (self.vault / "knowledge/concepts").mkdir(parents=True)
+        (self.vault / "knowledge/concepts/solid.md").write_text("# SOLID Principles", encoding="utf-8")
+        (self.vault / "knowledge/patterns").mkdir(parents=True)
+        (self.vault / "knowledge/patterns/factory.md").write_text("---\ntitle: Factory Pattern\n---\n# Pattern Note", encoding="utf-8")
+
+        res = linter.generate_moc(self.vault, "knowledge", "MOC.md")
+        self.assertEqual(res["status"], "created")
+        self.assertEqual(res["indexed_notes_count"], 2)
+
+        moc_file = self.vault / "knowledge/MOC.md"
+        self.assertTrue(moc_file.is_file())
+        text = moc_file.read_text(encoding="utf-8")
+
+        self.assertIn("# Knowledge — Map of Content (MOC)", text)
+        self.assertIn("### Concepts", text)
+        self.assertIn("[[knowledge/concepts/solid.md|SOLID Principles]]", text)
+        self.assertIn("### Patterns", text)
+        self.assertIn("[[knowledge/patterns/factory.md|Factory Pattern]]", text)
+        self.assertIn(linter.MOC_START_MARKER, text)
+        self.assertIn(linter.MOC_END_MARKER, text)
+
+    def test_generate_moc_preserves_user_content(self):
+        (self.vault / "projects/my-ws").mkdir(parents=True)
+        (self.vault / "projects/my-ws/note1.md").write_text("# Module One", encoding="utf-8")
+
+        moc_path = self.vault / "projects/my-ws/MOC.md"
+        user_header = "# Handcrafted Project Dashboard\n\nCustom user guidance here.\n\n"
+        user_footer = "\n\n## User Checklist\n- [x] Setup repository\n- [ ] Deploy"
+        existing_moc = user_header + linter.MOC_START_MARKER + "\nold stale index\n" + linter.MOC_END_MARKER + user_footer
+        moc_path.write_text(existing_moc, encoding="utf-8")
+
+        # Run MOC update
+        res = linter.generate_moc(self.vault, "projects/my-ws", "MOC.md")
+        self.assertEqual(res["status"], "updated")
+
+        new_text = moc_path.read_text(encoding="utf-8")
+        self.assertTrue(new_text.startswith(user_header))
+        self.assertTrue(new_text.endswith(user_footer))
+        self.assertIn("[[projects/my-ws/note1.md|Module One]]", new_text)
+        self.assertNotIn("old stale index", new_text)
+
+    def test_cli_lint_and_moc_subcommands(self):
+        (self.vault / "knowledge").mkdir(parents=True)
+        (self.vault / "knowledge/doc1.md").write_text("# Doc 1\n[[doc2]]", encoding="utf-8")
+        (self.vault / "knowledge/doc2.md").write_text("# Doc 2\n[[doc1]]", encoding="utf-8")
+
+        # 1. Test CLI lint via cli.main
+        res_lint, code_lint = cli.main(["--vault", str(self.vault), "--state", str(self.state), "lint"], return_result=True)
+        self.assertEqual(code_lint, 0)
+        self.assertEqual(res_lint["status"], "ok")
+        self.assertEqual(res_lint["broken_links_count"], 0)
+
+        # 2. Test CLI moc via subprocess
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/serobeyinn_v3.py"),
+                "--vault", str(self.vault),
+                "--state", str(self.state),
+                "moc",
+                "--folder", "knowledge",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=inherited_env(),
+        )
+        parsed = json.loads(proc.stdout)
+        self.assertEqual(parsed["status"], "created")
+        self.assertEqual(parsed["indexed_notes_count"], 2)
+        self.assertTrue((self.vault / "knowledge/MOC.md").is_file())
+
+    def test_missing_receipt_is_broken_and_existing_private_note_is_withheld(self):
+        (self.vault / "receipts").mkdir(exist_ok=True)
+        (self.vault / "knowledge").mkdir(exist_ok=True)
+        (self.vault / "knowledge/link.md").write_text("[[receipts/missing.md]]", encoding="utf-8")
+        report = linter.lint_vault(self.vault)
+        self.assertEqual(report["status"], "issues_found")
+        self.assertEqual(report["broken_links_count"], 1)
+        self.assertEqual(report["withheld_targets_count"], 0)
+
+        (self.vault / "inbox").mkdir(exist_ok=True)
+        (self.vault / "inbox/secret.md").write_text("---\nvisibility: private\n---\nGizli.\n", encoding="utf-8")
+        (self.vault / "knowledge/link.md").write_text("[[inbox/secret.md]]\n[[secret]]", encoding="utf-8")
+        report = linter.lint_vault(self.vault)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["broken_links_count"], 0)
+        self.assertEqual(report["withheld_targets_count"], 2)
+        self.assertNotIn("secret", json.dumps(report))
+
+    def test_lint_excludes_directories_correctly(self):
+        # Create root vendor.md (should NOT be treated as a directory or excluded from orphans)
+        (self.vault / "vendor.md").write_text("# Vendor Root File", encoding="utf-8")
+        # Create an excluded directory vendor/ with an orphan note inside
+        (self.vault / "vendor").mkdir(parents=True)
+        (self.vault / "vendor/ignored.md").write_text("# Ignored Orphan", encoding="utf-8")
+        # Configure state to exclude 'vendor' directory
+        state_dir = self.state / "index"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        # Write exclusions to state index or mock exclusions
+        with patch("serobeyinn_v3_index.exclusions", return_value=(frozenset({"vendor"}), set())):
+            report = linter.lint_vault(self.vault, state=self.state)
+        self.assertEqual(report["status"], "ok")
+        # vendor.md should be in orphans because it has no links, whereas vendor/ignored.md is excluded
+        orphans = report["orphans"]
+        self.assertIn("vendor.md", orphans)
+        self.assertNotIn("vendor/ignored.md", orphans)
+
+    def test_markdown_links_graph_integration(self):
+        (self.vault / "birinci.md").write_text("# Birinci\n[İkinci](ikinci.md)\n", encoding="utf-8")
+        (self.vault / "ikinci.md").write_text("# İkinci\n[Birinci](birinci.md)\n", encoding="utf-8")
+        result = linter.lint_vault(self.vault)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["orphan_count"], 0)
+        self.assertEqual(result["unlinked_count"], 0)
+        self.assertEqual(result["total_links_count"], 2)
+
+    def test_markdown_links_resolution_and_relative(self):
+        (self.vault / "sub").mkdir()
+        (self.vault / "sub dir").mkdir()
+        (self.vault / "sub dir/target note.md").write_text("# Target\n## Heading\n", encoding="utf-8")
+        (self.vault / "sub/sibling.md").write_text("# Sibling\n", encoding="utf-8")
+        (self.vault / "sub/source.md").write_text(
+            "# Source\n[Not](../sub%20dir/target%20note.md#Heading)\n[Sibling](../sub/sibling.md)\n",
+            encoding="utf-8",
+        )
+        result = linter.lint_vault(self.vault)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["broken_links_count"], 0)
+
+    def test_markdown_exact_relative_paths_and_private_targets(self):
+        self._write_notes(self.vault, {
+            'same.md': '# Root', 'sub/same.md': '# Sibling', 'only-root.md': '# Root only',
+            'hidden.md': '# Public root', 'sub/hidden.md': '---\nvisibility: private\n---\n# Canary',
+            'sub/source.md': '[a](same.md#Sibling) [b](/same.md#Root) [c](only-root.md) '
+                             '[d](missing/other.md) [e](../only-root.md) [f](../../same.md) '
+                             '[g](hidden.md) [h](photo.png) [i](/photo.png)',
+            'other.md': '# Other'
+        })
+        (self.vault / 'photo.png').write_bytes(b'picture')
+        result = self._lint_cli()
+        self.assertEqual({link['target'] for link in result['broken_links']},
+                         {'only-root.md', 'missing/other.md', '../../same.md', 'photo.png'})
+        self.assertEqual(result['withheld_targets_count'], 1)
+        self.assertNotIn('sub/hidden.md', json.dumps(result))
+
+    def test_lint_and_moc_apply_retirement_without_exposing_replacements(self):
+        self._write_notes(self.vault, {
+            'knowledge/old.md': '---\nid: old-id\n---\n# OldCanary',
+            'knowledge/retired.md': '---\nstatus: ArŞİv\n---\n# RetiredCanary',
+            'knowledge/private.md': '---\nvisibility: Private\n---\n# PrivateCanary',
+            'knowledge/active.md': '# Current',
+            'knowledge/current.md': '[[old]] [history](retired.md) [[private]] [[active]]',
+            'projects/other/new.md': '---\nproject: other\nvisibility: private\nsupersedes: old-id\n---\n# NewCanary',
+            'projects/other/fake.md': '---\ntrust: untrusted\nsupersedes: active\n---\n# FakeCanary',
+        })
+        result = self._lint_cli('--folder', 'knowledge')
+        self.assertEqual((result['broken_links_count'], result['withheld_targets_count']), (0, 3))
+        self.assertNotIn('old.md', json.dumps(result))
+        linter.generate_moc(self.vault, 'knowledge')
+        moc = (self.vault / 'knowledge/MOC.md').read_text(encoding='utf-8')
+        self.assertIn('knowledge/active.md', moc)
+        self.assertNotIn('Canary', moc)
+
+    def test_markdown_links_ignored_external_anchors_and_code(self):
+        (self.vault / "a.md").write_text(
+            "# A\n"
+            "[External](https://example.com/a.md)\n"
+            "[Anchor](#only-anchor)\n"
+            "`[Fake](fake.md)`\n"
+            "```\n"
+            "[CodeFence](fake2.md)\n"
+            "```\n",
+            encoding="utf-8",
+        )
+        result = linter.lint_vault(self.vault)
+        self.assertEqual(result["orphan_count"], 1)
+        self.assertEqual(result["total_links_count"], 0)
+
+    def test_markdown_links_broken_and_traversal(self):
+        (self.vault / "a.md").write_text(
+            "# A\n[Eksik](yok.md)\n[bad](../../outside.md)\n",
+            encoding="utf-8",
+        )
+        result = linter.lint_vault(self.vault)
+        self.assertEqual(result["status"], "issues_found")
+        self.assertEqual(result["broken_links_count"], 2)
+        self.assertEqual({link["target"] for link in result["broken_links"]}, {"yok.md", "../../outside.md"})
+        self.assertTrue(all(link["type"] == "markdown" for link in result["broken_links"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

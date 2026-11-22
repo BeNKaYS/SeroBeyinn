@@ -1,0 +1,264 @@
+# V3 local memory foundation
+
+This module is an opt-in foundation, not a replacement installer or lifecycle migration. Existing hooks and the isolated compiler are unchanged. It makes no model calls and imports no remote provider. It must be given an existing synthetic or explicitly authorized vault and a runtime directory outside that vault.
+
+`template/.claude/scripts/serobeyinn_v3.py` exposes `MemoryStore(state_dir, vault_root)`. SQLite records and receipts persist in `state_dir/memory.sqlite3`; the runtime directory is private to the local account. Each operation owns and closes its connection. Write operations use `BEGIN IMMEDIATE` transactions; this is local process coordination, not distributed cloud synchronization.
+
+The database records the resolved vault root it was created for (`metadata.vault_root`) and refuses any other root with `runtime belongs to another vault`, so two vaults never share one index. Nothing rebinds it implicitly. For a moved vault, `install_v3.py --state <state> --rebind-state` moves the binding after verifying that the recorded folder is gone or is the same folder, or provably uses another state root, and that the vault carries this state's installation pin; it copies the database to `memory-before-rebind.sqlite3` first. See [MULTI-MACHINE.md](MULTI-MACHINE.md#vaultu-başka-klasöre-ya-da-hesaba-taşımak).
+
+## Hook acknowledgement retention
+
+Every processed hook event is first acknowledged as a private `state/hook-done/<sha256>.json` marker. These recent markers prevent duplicate work without needing to read the database when the same event is immediately replayed.
+
+On successful queue drains, `serobeyinn_v3_hook_done.py` migrates markers older than seven days into the local `memory.sqlite3` table `hook_done_ledger` (at most 256 per run). Its row stores only the event hash, harness and lifecycle event name, not prompt or session text. The SQLite transaction commits **before** the JSON is removed: if a worker crashes between those steps, both copies are harmless and `doctor` counts the event once. A failed migration never deletes its marker. When no old markers are found, the scan is limited to once per day.
+
+Newly delivered events are checked against both the live markers and this ledger. `doctor` combines recent JSON and archived lifecycle metadata so migration does not reset previously observed clients or inflate `acknowledged_events`. This is local-only and requires no extra service or dependency.
+
+The ledger intentionally **retains event hashes indefinitely**, because removing old hashes would allow very late event-ID replays. This change bounds the number of individual JSON files during ordinary use; it does not promise bounded SQLite storage or a measured speed-up. A state reset, backup or restore should keep `memory.sqlite3` and `hook-done/` together.
+
+The local `hook-error.json` diagnostic, also available in JSON `doctor` output, records the last hook error's timestamp and exception type. When an `OSError` carries an integer `errno`, the diagnostic records that number too. It does not store exception messages, filenames or prompts. A successful drain can clear the diagnostic; if the state cannot be written, recording the error remains best-effort.
+
+## Event retention and state size
+
+Every real record change stores a full snapshot in the `events` table, so a vault that is edited daily, or reindexed by an upgrade, grew `memory.sqlite3` without bound before #585. Only `history` reads old snapshots; the receipt-view quarantine stores `MAX(sequence)` as a cutoff, and sync, receipts, `doctor` and the usage report never read old rows. `serobeyinn_v3_retention.py` therefore keeps:
+
+- the newest event of every record that still exists, which is exactly what a fresh sync of the same vault writes, so `history` of a current record is never empty;
+- at most the 10 newest events of each record, and only for 30 days; a deleted record keeps its trail, ending in its `delete` event, for that window;
+- the newest row of the table, so `MAX(sequence)` never moves back. `AUTOINCREMENT` never reuses a sequence number.
+
+The table has no time column and gets none, because a release before this one reads the same database after a rollback. Age comes from sequence marks in `metadata`: at most once a day the current `MAX(sequence)` is saved with the time, and an event at or below a mark saved 30 days ago is at least that old. Events written before the first mark count as new for one full window, so an upgraded vault loses nothing older for 30 days except snapshots beyond a record's newest 10.
+
+The background queue worker prunes at most 500 rows per successful drain on the same SQLite writer lock, after acknowledgement and hook-done compaction, and never in a worker started by a `SessionStart` or `UserPromptSubmit` hook, which may wait for it. Once the backlog is gone it checks at most once a day. It never reads the vault. In the same run it removes leftover temp files older than one day from the state root, `hook-queue/` and `receipt-reminders/`, matching only the temp names this runtime writes there (`hook-health.json.<hex>.tmp`, `.index-xxxxxxxx` and the like). The hook's own atomic writer now removes its temp file when the replace fails. On POSIX, the same run and `state-compact` also delete Jev score entries (`<state>/.cache/jev/<sha256>.json`) whose file modification time and valid JSON `created_at` are older than one day, the longest `cache_ttl` Jev accepts. Directory-descriptor-relative operations prevent a concurrent symlink swap from redirecting deletion. Cleanup and this version's Jev cache publisher share a nonblocking directory lock; a busy or unsupported lock skips cleanup (and skips cache publication for that call, without discarding the returned score). Windows cleanup is disabled until equivalent reparse-point-safe deletion is available. `state-compact --dry-run` and `doctor` count safely sweepable entries as `expired_jev_cache`; zero can also mean unsupported or busy, not an empty cache. Malformed old entries cannot be cache hits and may be removed; files larger than 1 MiB are conservatively retained. Older runtime versions do not participate in the publication lock: do not run an old cache writer concurrently with cleanup.
+
+Deleted rows become free pages that SQLite reuses, so the file stops growing; it does not shrink by itself. A database created by this release uses incremental auto-vacuum and the worker returns at most 1024 free pages per run. A full `VACUUM` rewrites the whole file under an exclusive lock, so it runs only from the explicit command `python3 serobeyinn.py state-compact` (Windows: `py -3 serobeyinn.py state-compact`; `--dry-run` reports what would go without writing). The command prunes everything due now, removes stale temp files, switches an older file to incremental auto-vacuum and runs `VACUUM`; a busy index is reported and left as it was. `doctor` reports `state_storage` (index size, free bytes, event count, auto-vacuum mode, stale temp files) as information only and suggests the command when at least 64 MiB and a quarter of the file are free pages. Neither path touches the vault, the receipts or `hook_done_ledger`.
+
+## Records and source references
+
+`ingest(record)` requires `id`, `text`, and `source`. The source must be an existing relative file resolving inside the vault. Traversal and escaping symlinks are rejected. Records preserve all supplied structured fields, including `facts`, `kind`, `project`, `status`, `visibility`, `updated_at`, and `supersedes`. Facts default to an empty mapping, revision to 1, visibility to internal, and supersedes to an empty list. When `updated_at` is absent or blank it is filled from the first of `updated`, `modified`, `last_modified`, `date_modified` whose value is a string beginning with an ISO date; other values are ignored and file modification time is never used, because synchronized vaults rewrite it. The alias stays in the record and the source file is not rewritten.
+
+Ingesting the exact same record is idempotent. Reusing an existing ID for different content fails. `update_task(id, expected_revision, changes)` performs a locked revision comparison and increments the revision; it does not permit changing the record ID or directly setting its revision. These updates affect the local record store, not source Markdown files. They do not claim external verification or completion.
+
+`submit_receipt(event_id, summary, refs, harness)` requires existing source references. Replaying the same semantic payload, including from the other harness, returns the original receipt. Changing summary or references under an existing event ID fails. First-writer harness attribution is retained. Receipts are stored locally and do not automatically append to daily notes or project views.
+
+Codex reports edits when its PostToolUse event names an editor matched by the installed hook. In code-mode hosts that report only the outer `exec` call, an inner `apply_patch` can change Markdown without opening the edit window. Receipt coverage can then undercount edits. Record a receipt explicitly after meaningful work. SessionStart context and the Stop event have separate triggers.
+
+The Claude/Codex Stop learning reminder treats knowledge references as citations, not proof that a note was updated. Its filesystem evidence accepts either a distilled Markdown note cited in the receipt's `refs` with modification time at or after the edit window began, or a PostToolUse editor write of such a note (Claude file path, Codex apply_patch header) in the same window, since that write precedes the hook that opens the window. The editor check examines all parsed paths in the hook's bounded input payload, rather than only the first five. File symlinks are rejected, and resolved paths must remain inside the vault and within the existing distillation roots, outside generated-file exclusions; the mtime check also requires the cited path itself to name a distilled note. An unrelated recent note elsewhere in the vault no longer satisfies the receipt's learning claim, and citing an older note alone does not suppress the reminder. Candidates staged for this session in the current edit window can also satisfy the separate candidate-ledger check. Filesystem evidence remains a time heuristic, not content-hash verification, proof of authorship or a semantic check that the declared learning was saved; a sync tool can change modification times without changing content.
+
+## Retrieval and harness parity
+
+`retrieve(query, project=None, audience='internal', statuses=None, limit=5, budget_chars=8000)` returns records, source citations, abstention, truncation, omitted count, and a visible character budget. Retrieval uses normalized Turkish/English lexical tokens, conservative query stopwords and removal of the explicitly selected project token. It has no embeddings, natural-language reasoning, or inferred task completion.
+
+Turkish is agglutinative, so every token is reduced to one canonical stem by a small suffix stripper before scoring, on the query side and the document side alike. It peels an ordered longest-match table of nominal suffixes to a fixpoint, refuses to touch words shorter than five characters, keeps a stem floor of three characters for plurals and four or five for the rest, and gates each suffix on the preceding sound plus a weak vowel-harmony check. That is why `farkı` finds a note about `fark` and `notlar` finds a note about `not`. Consonant softening is handled for p/b and k/ğ: a stem ending in a vowel plus `b` or `g` (soft g is folded to `g`) is written back with `p` or `k`, so `kitabı`, `örneği` and `temizliği` meet `kitap`, `örnek` and `temizlik`. Known limits: it is a heuristic with no lexicon, so it does not model t/d or nk/ng softening (`ümit`/`ümidi`, `renk`/`rengi` stay apart; d would merge past tense stems such as `denedi` into `denetim`), vowel loss or doubling (`kayıt`/`kaydı`, `hak`/`hakkı`), and it cannot strip suffixes off three-letter roots other than plurals (`ev`/`evden`), it over-peels some words into non-words that only have to be consistent (`araba` and `arabanın` both become `arab`), and it merges a small number of English words that happen to end in a Turkish suffix (`quota`/`quote`, `viola`/`violin`); measured over 198k dictionary words, 4.5 percent land in a merged group, while `table`/`tab`, `handle`/`hand`, `golden`/`gol`, `garden`/`gar` and `state`/`sta` stay apart. Verb inflection is out of scope. Stems replace tokens, they are never added alongside them, so a score still counts matched query words and `STRICT_MIN_SHARED` keeps its meaning. Nothing is stored: tokens are computed per query, so an existing vault needs no reindex after upgrading.
+
+Filters apply before scoring. Public sees public; internal sees internal and public; private is explicit. Untrusted records never enter context. Project filtering is exact. Supersession is resolved over every trusted record, not only the eligible ones: a `supersedes` value names a note by its explicit id, by vault path (with or without `.md`) or `[[link]]`, or by its file name when exactly one note has it, never by substring. A value that resolves to nothing, to several notes or to the note itself retires nothing; sync reports it as `supersedes_issues` and doctor as `supersedes`, without degrading either. Untrusted notes cannot retire another note. Without explicit statuses every route drops notes whose status starts with a retired word (`superseded`, `retired`, `archived`, `deprecated`, `obsolete`, `replaced`, `arşiv`, `eski`, `emekli`, `geçersiz`); any other status stays deliverable. Explicit status filters select exactly the requested first words, case and Turkish letters folded; a note without a status counts as active, a task without one does not. Non-strict matches (`retrieve`, `candidates`, the `context` command) are ranked by Okapi BM25 over stem counts (`k1` 1.5, `b` 0.75) with timestamp as a tie-breaker, so a long hub note that mentions every query word once no longer outranks the note that is about them; records with no shared term keep timestamp order. Strict matches keep the calibrated weight and thresholds described below. Unknown queries abstain. Structured facts and citations are preserved; oversized text may be clipped with an explicit marker and text_truncated flag when the metadata fits, otherwise the record is omitted; the budget measures serialized record/citation characters, not tokenizer tokens or the entire response envelope.
+
+The explicit `context` command adds `unmatched_terms`: sorted, deduplicated query words (case/diacritic folded, matched using the engine's stemming, excluding stopwords) absent from the **delivered** records' text, titles, fact values and aliases. This additive lexical diagnostic does not change ranking, admission, budgets or `abstained`. It is not proof that a topic is missing from the vault: clipping, the result limit, scope/privacy filters and synonyms can all leave a term unmatched. Hidden, stale and unselected records are not inspected for this field; with no delivered records, all non-stopword query tokens are unmatched. It is also computed after optional Jev selection; automatic hook context is unchanged.
+
+Supersession is stateless: the current trusted index determines each match, with no persisted target binding. A new same-basename note can therefore make a formerly unique name reference ambiguous and let its old target return to context; one added at the vault root matches a bare value as an exact path, so it is retired in the old target's place without any report. Prefer an explicit id or full vault-relative path to avoid this collision. Explicit `sync` and `doctor` human output shows a bounded warning for ineffective references; JSON fields, command statuses and per-turn hook behavior are unchanged. See [Supersedes references](MARKDOWN.md#supersedes-references) for the repair steps and limits.
+
+The per-turn hook asks for strict context (`context_for(..., strict=True)`), which ranks Markdown passages instead of whole notes (`serobeyinn_v3_passage.py`, #83). Each record's text is split into heading-aware blocks (oversized blocks become overlapping windows of about 900 characters), a block is admitted with the same relative-idf weight family scaled by query coverage, and the best block per source is delivered with its heading path through the same `pack_context` budget and citation contract. Admission uses block frequency, ranking among admitted sources uses source frequency, and the coverage denominator is capped at four terms so a long conversational prompt is not rejected for its length. Frontmatter is never read (records carry the Markdown body), `daily/` and `receipts/` are always excluded, supersession, visibility, trust, project and freshness gates are the same `_eligible()` gates as the note-level path, and explicit project words do not count as matches. The derived index lives in the runtime directory as JSON (`passages.json`, 0600), re-tokenised only for changed records; a cold build runs in one-second steps and meanwhile, like any real error, falls back to the note-level path. A read-only store (a hook turn while a sync is pending) still saves that progress, because `passages.json` is derived data written atomically and ignored when stale or unwritable; it never touches the SQLite database, and a failed write only costs speed. An empty passage result is an answer, not a fallback. `retrieval.json` in the runtime directory may set `strict_floor` (default 0.20) and extra `strict_exclude` prefixes; see PREFERENCES.md. The same file can opt the unscoped explicit `context` command (no `--project`) into two-word admission (`unscoped_min_shared: 2`) and dominant-project demotion (`unscoped_dominant_weight`, BM25 part only); both are off by default because they cost recall on the frozen fixtures (#532). `scripts/evaluate_v3_passages.py` measures both paths on a deterministic synthetic corpus or, read-only, on your own vault.
+
+Both clients call `shared_context(store, harness, query, **kwargs)` or `store.context_for(harness, query, **kwargs)`. Codex and Claude use exactly the same retrieval implementation and normalized output. `codex_context` and `claude_context` are convenience wrappers.
+
+`optional_provider()` returns None by default without imports or calls. An enabled provider requires an explicitly supplied factory; integrations must call this intentionally. The local store never depends on the provider's existence or state.
+
+## Validation boundary
+
+The frozen semantic contract and an independent test lane own acceptance. The implementation does not read holdout scenarios or hardcode fixture IDs. Small synthetic lexical gates cannot establish broad language understanding. Real lifecycle delivery, user-facing approval, installer migration, compiler execution and multi-machine reconciliation remain outside this foundation. Existing compiler staging, output allowlists, source hashes and restricted model execution must remain intact if a later migration integrates this store.
+
+## Vault binding and source freshness
+
+Each database is bound to the canonical vault root. Reusing a runtime for a different vault fails rather than mixing contexts. Ingest captures a source SHA256; retrieval excludes missing or changed sources and returns `stale_count` for eligible records. Explicit revision updates refresh the source snapshot; this is not automatic external verification. This foundation's indexed records are authoritative for its state API, not a replacement for canonical Markdown task synchronization. A project-only query lists eligible records in that scope; an unscoped query without meaningful terms abstains.
+
+## Transactional history
+
+Record ingestion and revision updates append an immutable snapshot event inside the same SQLite transaction as the record projection. `history(record_id, audience="internal")` returns committed `{sequence,event_type,record_id,revision,record}` entries in global monotonic sequence order; event types are `ingest` and `update`, and Markdown synchronization adds `delete` when a source is removed or no longer validates. Duplicate ingestion, rejected revisions and validation failures create no events. History is empty when the current record is outside the audience or untrusted, or its source hash is stale; a deleted record is judged by the snapshot in its final `delete` event. Individual events outside the audience are omitted. Snapshots past the retention described in "Event retention and state size" are gone; the newest snapshot of a current record always stays. The CLI `history` command synchronizes first. Returned JSON objects are fresh copies. Receipts retain their separate idempotency table.
+
+Initialization adds the events table to existing foundation databases. Prior mutations remain explicitly unrecorded prehistory; the module does not invent baseline events for old rows. This is a local audit history, not a distributed log or a complete event-replay migration tool.
+
+Supply a dedicated application runtime directory. Initialization sets that exact directory to account-private permissions; never pass a general home, cache, or shared parent directory. Its parent permissions are not modified.
+
+## Managed paths and unmanaged user layer
+
+V3 writes exclusively to its explicit managed vault files:
+- Entry point and metadata: `serobeyinn.py`, `.serobeyinn-runtime.json`, `.serobeyinn-version`.
+- Scripts: `.claude/scripts/serobeyinn_v3*.py`.
+- Managed starter skills: `.agents/skills/{serobeyinn,serobeyinn-doktor,serobeyinn-guncelle,serobeyinn-kontrol}/`, `.claude/skills/...`, and `.kiro/skills/...`. A same-named skill the user already has is left as it is; a rollback removes the folders of a skill the update added.
+- Platform launchers: `SeroBeyinn Guncelle.cmd`, `SeroBeyinn Güncelle.sh`, `SeroBeyinn Guncelle.command`, `SeroBeyinn Güncelle.desktop`.
+- Adapter shims: `.claude/hermes-plugin/`, `.claude/scripts/serobeyinn_v3_kiro.py`, `.opencode/plugins/`, `.omp/hooks/`, `.pi/extensions/serobeyinn-v3.ts`.
+- Harness hook declarations: `.claude/settings.local.json`, `.codex/hooks.json`, `.codex/config.toml`, `.agents/hooks.json`, `.kiro/hooks/serobeyinn-v3.json`.
+- Companion instruction blocks: `AGENTS.md`, `CLAUDE.md`.
+
+All other paths belong to the user. In particular, `.brain/` and `custom/` directories are reserved as an untouched, unmanaged user layer. Installer, updater, and `doctor` checks never treat files under `.brain/` or `custom/` as conflicts or unmanaged system intrusions.
+
+## Proje klasörü kapsamlarını yönetme
+
+`.serobeyinn-projects.json` içindeki bulunamayan klasörler uyarı ve doctor tanısı üretir; diğer
+projelerin sorguları devam eder. Eksik klasör eşlemesi eski `--no-sync` indeks satırlarının
+başka projelere ortak not gibi açılmaması için kapsam sınırı olarak korunur.
+
+Kasa dışına çıkan, mutlak ya da `.` içeren yol, boş proje adı veya iki projeye atanmış klasör
+gibi tek bir hatalı girdi artık bütün açık proje çağrılarını durdurmaz: girdi stderr uyarısıyla
+atlanır, işaret edebileceği kasa klasörü hiçbir projeye açılmaz ve girdi düzeltilene kadar
+`shared_unscoped` kapalı sayılır. Bozuk JSON veya bilinmeyen anahtar gibi dosya düzeyindeki
+hatalar açık proje çağrısını durdurmaya devam eder. Okuma dosyayı değiştirmez.
+
+`project-scope list` yalnız okur. `project-scope add --folder "Projeler/Deneme" --project deneme`,
+`project-scope remove --folder "Projeler/Deneme"` ve `project-scope prune` açıkça kapsam
+dosyasını düzenler. `prune` artık bulunamayan klasör girdilerini ve geçersiz yolları çıkarır. Bozuk
+veya symlink yapılandırma üzerine yazılmaz; önce dosyayı onar.
+
+`--shared-unscoped on|off` yalnız `add` ile kullanılabilir. Eylemsiz çağrı `list`
+sayılır; bayrak eylemsiz, `list`, `remove` veya `prune` ile verilirse komut hiçbir
+kapsam veya runtime dosyasını değiştirmeden açık hata ve çıkış kodu 1 döndürür.
+Mevcut eşlemeyi koruyarak ayarı değiştirmek için aynı klasör ve proje adıyla yeniden
+`add` kullan:
+
+```sh
+python3 serobeyinn.py project-scope add --folder "Projeler/Deneme" --project deneme --shared-unscoped on
+```
+
+Windows'ta `python3` yerine `py -3` kullan. Kapatmak için `off` ver; bayrağı
+vermezsen mevcut değer korunur, yeni dosyada varsayılan `false` olur. `add` çıktısı
+kaydedilen `shared_unscoped` değerini de gösterir. `on`, hiçbir
+projeye atanmamış uygun notları dış proje köprüsü dahil tüm açık proje sorgularına
+dahil eder; başka projeye ait veya `private` notları açmaz. Yalnız mevcut değeri
+görmek için bayraksız `project-scope list` kullan.
+
+## Çalışma alanları, bağlantı denetimi ve MOC
+
+`workspace`, `lint` ve `moc` yalnız açıkça çağrıldığında çalışır; SessionStart, `sync` ve
+`doctor` bunları çalıştırmaz. `workspace list`, `workspace inspect`, `workspace plan`,
+`workspace provision --dry-run` ve `lint` salt okunurdur ve state oluşturmaz.
+
+- Çalışma alanı üstverisi (ad, tür, yaşam döngüsü, kural dosyası, not kökleri, provision
+  durumu) vault kökündeki `.serobeyinn-workspaces.json` dosyasındadır. Klasör bağlantıları
+  `.serobeyinn-projects.json` içindeki `folders` haritasında kalır ve o dosyanın biçimi değişmez.
+  Eski sürüm kapsam dosyasını aynen okur ve kayıt dosyasını yok sayar; `rollback` sonrasında
+  proje kapsamları çalışmaya devam eder. Bir çalışma alanının kaynakları her okumada `folders`
+  haritasından türetilir: `project-scope add/remove` ile yapılan değişiklik hemen görünür.
+  Kaydı olmayan projeler `registered: false` ile listelenir. Daha yeni bir şema sürümüyle
+  yazılmış veya bozuk kayıt dosyası değiştirilmez.
+- `workspace disconnect` yalnız hala o çalışma alanını gösteren bağlantıyı kaldırır; diskteki
+  klasöre ve notlara dokunmaz. `archive` kapsamı değiştirmez, çalışma alanını yalnız listeden
+  gizler.
+- `workspace provision <id>` ilk dosyadan önce `provision.status: pending` kaydını yazar, sonra
+  klasörleri ve şablonları oluşturur (var olan dosya korunur), klasörleri bağlar ve doğrular.
+  Proje klasörü vault'un kendi proje klasörünün altındadır (şablonda `🏰 300-Projects/<id>`,
+  yoksa `projects/<id>`). `--source` verilse de kural ve MOC şablonlarının bulunduğu bu klasör
+  ve not kökü de çalışma alanına bağlanır (`plan` çıktısındaki `bindings`); doğrulama, şablon
+  dosyalarının retrieval kapsamında bu çalışma alanına düştüğünü de denetler.
+  Hata olursa yalnız bu denemenin kendi değişiklikleri geri alınır: oluşturduğu ve değişmemiş
+  dosyalar, boş kalan klasörler, hala bu çalışma alanını gösteren bağlantılar ve kendi kaydı.
+  Arada yapılmış başka değişiklikler korunur. Bir şey geri alınamazsa hata çıktısındaki
+  `reconciliation` nesnesi neyin kaldığını söyler ve kayıt `provision.status: failed` olarak
+  kalır; aynı `workspace provision <id>` komutu kaydı kaldığı yerden tamamlar.
+- `lint [--folder <klasör>]` kırık wikilink, eksik başlık veya ek, yetim ve gelen bağlantısı
+  olmayan notları raporlar. Kısmi yol (`[[klasör/not]]`) ve ekler Obsidian gibi ad ve yol
+  sonuyla çözülür; kod blokları ve satır içi kod sayılmaz. Hassas, arşiv (`📦 900-Archive`,
+  `Arşiv` gibi), `visibility: private` ve kurulum klasörlerindeki notlar taranmaz; böyle bir nota
+  giden bağlantı da kırık görünür. İstisna: kökteki `receipts/` klasörünün üst seviyesinde
+  bulunan düz `.md` receipt dosyalarına tam vault yoluyla verilen bağlantı çözülür; receipt
+  gövdesi okunmaz ve `#başlık` bölümü doğrulanmaz. Receipt dosyaları tarama/MOC listesine
+  girmez; yalın ad veya olmayan receipt hâlâ kırık sayılır. Sayılar her zaman tam döner; listeler en fazla 100 kayıt
+  taşır, kalanı `truncated` alanında sayılır (tamamı için daha dar bir `--folder` kullan).
+  `folder_counts`, kırpılmadan önceki bulguları kaynak dosyanın doğrudan üst klasörüne
+  göre sayar (`.` kasa kökü); kırık bağlantı sayısı hedef dosya değil bağlantı adedidir.
+  En çok bulgusu olan ilk 100 klasör listelenir, eşitlikte yol sırası kullanılır; kalan
+  klasör ve bulgu sayıları `folder_counts_remaining` alanında tutulur. `--folder`
+  kullanıldığında bu dağılım da yalnız seçilen tarama alanını kapsar.
+  Configured `index.json` exclusions omit notes from orphan and unlinked findings,
+  including counts, folder summaries and truncated lists. The CLI reads the selected
+  runtime state without creating it. Bare directory names match at any depth using
+  the index's case and Unicode rules; invalid settings apply no exclusions.
+  Excluded notes still supply link targets and backlinks, and their broken links
+  remain visible. Scan and link counts, privacy filters and MOC behavior are unchanged.
+  Generated files have no separate exemption.
+- `moc [--folder knowledge] [--file MOC.md]` yalnız hedef klasördeki düz bir `.md` dosyasına
+  yazar. `CLAUDE.md`, `AGENTS.md`, `Kurallar.md` gibi talimat, companion veya kural dosyası
+  adları kabul edilmez. Dosya yoksa oluşturur. Varsa yalnız tek bir `<!-- serobeyinn-moc:start -->` ve
+  `<!-- serobeyinn-moc:end -->` çifti taşıdığında ve yalnız bu iki işaretin arasını yeniden üretir;
+  işaretsiz dosyaya dokunmaz. Dizinin görüneceği yere işaret çiftini elle ekle. MOC yalnız
+  kendi okuyucularının da görebildiği notları listeler: notun proje kapsamı (`project` alanı
+  veya `.serobeyinn-projects.json` klasörü) MOC dosyasının kapsamıyla aynı olmalı, görünürlüğü
+  MOC'unkinden dar olmamalı (`visibility: public` bir MOC yalnız public notları listeler) ve
+  `trust: untrusted` ya da reddedilmiş çıkarım olmamalı. İç içe kapsamda her proje klasörü için
+  ayrı `moc --folder <klasör>` çalıştır; atlanan notlar çıktıdaki `skipped` sayılarında görünür.
+  Kapsam dosyası değişince `moc` yeniden çalıştırılmalı. Değişiklik yoksa dosyaya yazılmaz.
+  Obsidian SeroBeyinn kilidini kullanmadığı için dosya, yeni metin hazır
+  olduktan sonra yeniden adlandırmadan hemen önce (içerik özeti, mtime, boyut, inode) tekrar
+  karşılaştırılır; değiştiyse hiçbir şey yazılmaz ve komut yeniden çalıştırılmayı ister.
+  macOS ve Linux'ta eski dosya yeniden adlandırma boyunca açık tutulur, bu arada yerinde
+  kaydedilen bir düzenleme fark edilip geri konur; önce dosyayı boşaltıp sonra yazan editör
+  için geri koymadan önce dosyanın değişmesi durana kadar (en fazla 0,2 sn) beklenir. Kalan
+  sınır: bir editör dosyayı tam bu mikro saniyelik aralıkta yeni bir dosyayla değiştirirse
+  işletim sistemi bunu kilitleyemez.
+
+## Receipt görünümü çakışması ve kurtarma
+
+`daily/v3/YYYY-MM-DD.md` ve `knowledge/v3/outcomes.md` değişmez receipt kaynaklarından
+üretilir. Görünüm elle değişmişse veya yerel takip geçmişi yoksa mevcut baytlar korunur
+ve `kind: receipt_view` uyarısı görünür kalır (`sync.status: degraded`). Sağlam kaynak
+bağlamı, lifecycle kayıtları ve yeni receipt yazımı devam eder; gerçek kaynak
+çakışmaları bağlamı ve geçmişi engellemeye devam eder. `receipt`, `task-update`,
+`context` ve `recap` JSON çıktıları ilgili tanıyı `source_sync.warnings` altında
+bildirir. `history` JSON liste biçimini korur ve uyarıyı stderr'e yazar.
+
+Yalnız CRLF/CR/LF farkı elle düzenleme sayılmaz. Yeni receipt özetleri LF kullanır;
+eski kaynak dosyalar ve indeks özetleri yeniden yazılmaz. CRLF çıkışlı bir receipt
+kaynağı, 3.12.0'ın okuduğu gibi sondaki CR ile dizine alınır; böylece `rollback`
+sonrasında eski sürümün bayt karşılaştırması da aynı satırı görür. Üretilen görünümler
+eski özetler için de LF kullanır. Sahipliği kanıtlanan eski görünüm ilk sync'te LF'ye
+geçer; takip edilen hash yazılan ham baytlara aittir ve sonraki LF kayıtları yeniden
+yazılmaz. Görünüm, güncel deterministik
+çıktıyla satır sonları dışında aynıysa güncellenebilir. Eski karma satır sonlu görünüm
+gecikmişse, içerdiği receipt bağlantıları yalnız yeniden üretilecek alt kümeyi seçer:
+yeniden üretilen **ham baytların** hash'i kayıtlı eski hash'e eşit olmalı, mevcut metin
+de yalnız satır sonlarında farklı olmalıdır. Bağlantı veya başlık tek başına yazma
+izni vermez. 3.10-3.12 sürümlerinin yazdığı görünüm o sürümlerin biçimiyle (hash adlı
+bağlantı, gizlenmemiş özet) yalnız karşılaştırma için yeniden üretilir; kanıt tutarsa
+güncel biçimle değiştirilir. Saat dilimi, başka bir üretici biçimi veya eksik geçmiş
+nedeniyle bu kanıt kurulamıyorsa görünüm korunur; aşağıdaki açık kurtarma komutunu
+kullanın. Aynı kontrol eski günlük düzenine ait takip edilen görünümün kaldırılmasında
+da geçerlidir.
+
+Takip edilen veya mevcut receipt'lerin üreteceği görünüm, başlığı silinse bile kaynak
+not olarak dizine eklenmez. Aynı dosyanın sabit bağlantıları da dışlanır. Önceden
+yanlışlıkla dizine alınmış görünüm kayıtları ve bu kayıtlara ait geçmiş olayları
+otomatik bağlamdan saklanır; denetim olaylarının baytları değiştirilmez. Görünümün
+yerinde sonradan oluşan gerçek bir not yeniden dizine alınabilir. Yerel state tamamen
+kaybolsa bile kurtarma arşivinin yanında kaydedilmiş köken bilgisi ve arşiv özeti,
+halen mevcut aynı sabit bağlantıyı tanımak için kullanılır. Bu yan kayıt silinirse,
+bozulursa veya bağlantı hem yer hem içerik değiştirirse eski köken yeniden
+kanıtlanamaz; bu dosyaları elle inceleyin.
+
+Açık kurtarma komutu: `python3 serobeyinn.py sync --recover-views` (Windows: `py -3 serobeyinn.py sync --recover-views`).
+Çakışan baytlar görünümün yanındaki `.archive/` içinde her denemeye ayrı bir dosya
+olarak kalıcı yazıldıktan sonra görünüm yeniden üretilir. Kurtarma başarısızsa kaynak
+ve takip kaydı korunur; symlink arşiv hedefleri kabul edilmez. Komut receipt kaynaklarını
+ve runtime veritabanını silmez. Arşivdeki kullanıcı eklemelerini uygun bilgi notlarına taşı.
+Sabit bağlantı varsa arşivin yanında küçük bir `.provenance.json` kaydı da saklanır;
+bu kaydı arşivle birlikte koruyun.
+POSIX'te özgün görünüm değiştirilmeden önce arşiv dosyası, arşiv dizini ve üst dizin
+`fsync` bariyerlerinden geçer; bariyer hatası kurtarmayı durdurur. Bu sıra güç kesintisi
+veya uzak dosya sistemi için mutlak kalıcılık garantisi değildir. Windows'ta dizin
+`fsync` desteği bulunmadığından aynı kalıcılık iddiası yapılmaz.
+
+### Öğrenim adaylarını sonuçlandırma hataları
+
+Açık bir `learn --resolve distilled|discarded` isteğinde aday defterinin varlığını denetleme veya mevcut defteri okuma, kilitleme ya da yazma işlemi bir G/Ç hatasıyla başarısız olursa komut çıkış 1 verir. JSON hatası, özel dosya yolu veya defter içeriği yerine sabit `learning candidate resolution failed` mesajını taşır. Başarılı sonuçlandırma, hatasız tamamlanan eşleşmesiz istek ve defterin bulunmaması mevcut sonuçlarını ve çıkış 0 davranışını korur. Eşleşme bulunmasa da mevcut yeniden yazma adımı çalışır; bu adımın G/Ç hatası da çıkış 1 verir. Receipt'in otomatik aday takibi isteğe bağlı kalır; sonuçlandırma hatası kalıcı receipt'i geri almaz veya başarısız saymaz. Defter biçimi ve yazma/tekrar davranışı değişmez.
+
+Açık `learn --list` isteği de mevcut aday defterinin denetimi veya okunması G/Ç hatasıyla başarısız olduğunda çıkış 1 ve özel yol/içerik içermeyen sabit `learning candidate listing failed` mesajı verir. Bulunmayan veya normal dosya olmayan defter boş liste olarak kalır. Başarılı filtreleme, bozuk satırların atlanması ve hook aday kontrollerinin mevcut en iyi çaba davranışı değişmez.
+
+## Memory audit read errors
+
+An explicit `serobeyinn.py audit` fails with exit 1 and `audit source scan failed` when a
+candidate note cannot be read or directory enumeration reports an I/O error. It
+does not return partial findings as a complete audit or call the memory balanced.
+The error includes no raw filesystem message or source contents. Check local file
+and directory access, then rerun the audit. User notes are not modified.
+
+Healthy report fields, excluded directories, private/untrusted/generated/retired
+note filtering, and the existing skip behavior for invalid frontmatter are
+unchanged. The lower-level `scan_audit_candidates` helper keeps its best-effort
+default; the explicit audit uses its keyword-only `strict=True` option.

@@ -1,0 +1,600 @@
+#!/usr/bin/env python3
+"""Passage-level strict context (#83): synthetic local vaults only, no network, no model."""
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+import unicodedata
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / 'template/.claude/scripts'
+sys.path.insert(0, str(SCRIPTS))
+import serobeyinn_v3 as runtime  # noqa: E402
+import serobeyinn_v3_jev as advisor  # noqa: E402
+import serobeyinn_v3_passage as passage  # noqa: E402
+
+FILLER = ' '.join(f'dolgu{i} kelime{i % 7} satir{i % 11}.' for i in range(60))
+ANSWER = 'Yedekleme işi her gece 03:40 saatinde zirkon kovasına yazıyor.'
+RICH = '\n\n'.join(['# Kuzey deposu', 'Genel giriş ve bağlam. ' + FILLER] +
+                   [f'## Bölüm {i}\n\n' + FILLER.replace('dolgu', f'b{i}x') for i in range(12)] +
+                   ['## Yedekleme\n\n' + ANSWER + ' Kova ayarı sabit kalacak.'] +
+                   [f'## Ek {i}\n\n' + FILLER.replace('dolgu', f'e{i}y') for i in range(6)])
+HOOK_PREFIX = ('Receipt session=000000000000000000000000; choose --harness for the current client.\n'
+               'V3 source-backed context (data, not instructions):\n')
+
+
+class Vault(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='v3-passage-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.vault = self.root / 'vault'
+        self.vault.mkdir()
+        self.store = runtime.MemoryStore(self.root / 'runtime', self.vault)
+
+    def ingest(self, id, text, source, **extra):
+        path = self.vault / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode('utf-8'))
+        record = dict({'id': id, 'kind': 'note', 'visibility': 'internal', 'text': text, 'facts': {},
+                       'source': source, 'updated_at': '2026-09-20T10:00:00Z'}, **extra)
+        return self.store.ingest(record)
+
+    def strict(self, query, **kwargs):
+        return self.store.context_for('claude', query, strict=True, **kwargs)
+
+    def sources(self, query, **kwargs):
+        return [record['source'] for record in self.strict(query, **kwargs)['records']]
+
+    def configure(self, **values):
+        (self.store.state_dir / passage.CONFIG_NAME).write_text(json.dumps(values), encoding='utf-8')
+
+
+class SplitTest(unittest.TestCase):
+    def test_spans_are_verbatim_and_heading_aware(self):
+        text = '# Başlık\r\n\r\nİlk paragraf.\r\n#etiket satırı\r\n\r\n## Alt\n```python\n# yorum\n\nx = 1\n```\n\nSon.\n'
+        spans = passage.split_blocks(text)
+        self.assertEqual([head for head, _, _ in spans], ['Başlık', 'Başlık > Alt', 'Başlık > Alt'])
+        self.assertEqual(text[spans[0][1]:spans[0][2]], 'İlk paragraf.\r\n#etiket satırı')
+        self.assertIn('# yorum\n\nx = 1', text[spans[1][1]:spans[1][2]])
+
+    def test_oversized_block_is_windowed_on_sentences_with_overlap(self):
+        sentences = [f'Cümle {i} burada biter ve biraz uzar.' for i in range(120)]
+        text = ' '.join(sentences)
+        spans = passage.split_blocks(text)
+        self.assertGreater(len(spans), 3)
+        for _, start, end in spans:
+            self.assertLessEqual(end - start, passage.BLOCK_TARGET + passage.BLOCK_OVERLAP)
+        for sentence in sentences:  # a sentence shorter than the overlap is never cut in two
+            self.assertTrue(any(sentence in text[s:e] for _, s, e in spans), sentence)
+        self.assertLess(spans[1][1], spans[0][2])
+
+    def test_heading_levels_keep_a_two_level_path(self):
+        text = '# A\n\n## B\n\n### C\n\nmetin\n\n## D\n\nson\n'
+        self.assertEqual([h for h, _, _ in passage.split_blocks(text)], ['B > C', 'A > D'])
+
+    def test_heading_closing_sequence(self):
+        for line, head in [('# Başlık ##', 'Başlık'), ('# C#', 'C#'), ('# ##', '##'), ('#\t##', '##'),
+                           ('## A ## B', 'A ## B'), ('### x #\t ', 'x'), ('   #### y  ###   ', 'y'), ('#', '')]:
+            with self.subTest(line=line):
+                self.assertEqual(passage.split_blocks(line + '\n\nmetin\n')[0][0], head)
+        for line in ('#etiket', '####### yedi', '    # kod'):
+            with self.subTest(line=line):
+                self.assertEqual(passage.split_blocks(line + '\n')[0][0], '')
+
+    def test_heading_with_a_long_whitespace_run_is_linear(self):
+        # A heading line holding a long run of spaces or tabs used to backtrack quadratically in
+        # the heading pattern: about 2.5 s for 20,000 spaces, 10 s for 40,000, in one hook turn.
+        for gap in (' ' * 40000, ' \t' * 20000):
+            text = '# a' + gap + 'b\n\nmetin\n'
+            started = time.perf_counter()
+            spans = passage.split_blocks(text)
+            self.assertLess(time.perf_counter() - started, 1.0)
+            self.assertEqual(spans[0][0], 'a' + gap + 'b')
+
+    def test_oversized_text_without_spaces_preserves_overlap_and_does_not_loop(self):
+        text = "a" * 49 + " " + "b" * 150
+        spans = passage._windows(text, 0, len(text), 100, 20)
+        self.assertLess(spans[1][0], spans[0][1], "Overlap was dropped!")
+
+    def test_overlap_fallback_keeps_bounded_window_count(self):
+        for text in ("a" * 49 + " " + "b" * 150, "a" * 1000, "a " + "b" * 1000):
+            with self.subTest(length=len(text)):
+                spans = passage._windows(text, 0, len(text), 100, 20)
+                self.assertLessEqual(len(spans), (len(text) + 99) // 100)
+                self.assertEqual(spans[0][0], 0)
+                self.assertEqual(spans[-1][1], len(text))
+                for previous, current in zip(spans, spans[1:]):
+                    self.assertGreater(current[0], previous[0])
+                    self.assertGreater(current[1], previous[1])
+                    self.assertLess(current[0], previous[1])
+                    self.assertLessEqual(previous[1] - current[0], 20)
+
+
+class PassageContextTest(Vault):
+    def test_a_question_naming_the_note_gets_the_section_that_answers_it(self):
+        # Every passage carries the title, so a question in the title's words matches all of
+        # them alike; the short update section used to win on size alone.
+        filler = 'Satır satır kayıt tutulur, sütunlar sabit kalır. ' * 20
+        text = ('# Zirkon Takvimi ve Kredi Planı\n\n## Güncelleme\n\nTabloya satır ekle.\n\n'
+                '## Kayıtlar\n\n' + filler + '\n\n'
+                '## Amaç\n\nZirkon takvimi kredi planı için tutulur: aylık sınır kırk kredi.\n')
+        self.ingest('takvim', text, 'notes/zirkon-takvimi.md', title='Zirkon Takvimi ve Kredi Planı')
+        # The passage route itself: MemoryStore.context_for would fall back to notes on an error.
+        records = passage.context_for(self.store, 'claude', 'zirkon takvimi kredi planı', budget_chars=5000)['records']
+        self.assertEqual([r['source'] for r in records], ['notes/zirkon-takvimi.md'])
+        self.assertIn('aylık sınır kırk kredi', records[0]['text'])
+        # The full source is a valid spare-room extension when it fits.
+        self.assertEqual(records[0]['text'], text)
+        self.assertFalse(records[0]['text_truncated'])
+
+    def test_short_root_second_passage_preserves_due_ranking(self):
+        text = ('# Zirkon\n\n## Özet\n\nZirkon boy kısa.\n\n'
+                '## Ölçüm\n\nBoy: 180 cm; güncel ölçüm. ' + 'Ayrıntılı kayıt. ' * 30 + '\n')
+        for ident, due, updated in [('a-due', '2020-01-01', '2026-01-01'),
+                                    ('z-future', '2099-01-01', '2026-10-01')]:
+            self.ingest(ident, text, 'tasks/' + ident + '.md', kind='task', status='active',
+                        title='Zirkon', due_at=due, updated_at=updated)
+        context = passage.context_for(self.store, 'claude', 'zirkon boyum', limit=1, budget_chars=5000)
+        self.assertEqual([r['id'] for r in context['records']], ['a-due'])
+        self.assertIn('180 cm', context['records'][0]['text'])
+        self.assertIn('a-due', context.wider)
+        self.assertLessEqual(context['used_chars'], 5000)
+
+    def test_a_second_passage_never_cuts_a_lower_source_short(self):
+        filler = 'Satır satır kayıt tutulur, sütunlar sabit kalır. ' * 12
+        for index in range(5):
+            name = 'Zirkon Takvimi Kredi %d' % index
+            self.ingest('t%d' % index, '# %s\n\n## Özet\n\nZirkon takvimi kredi özeti %d.\n\n## Kayıtlar\n\n%s\n\n'
+                        '## Amaç\n\nZirkon takvimi kredi planı: sınır %d.\n' % (name, index, filler, index),
+                        'notes/t%d.md' % index, title=name)
+        query = 'zirkon takvimi kredi planı'
+        for budget in (1500, 2500, 5000):
+            with self.subTest(budget=budget):
+                with patch.object(passage, '_runner_up', lambda *args: None):
+                    alone = {r['id']: r['text'] for r in passage.context_for(self.store, 'claude', query,
+                                                                             budget_chars=budget)['records']}
+                both = passage.context_for(self.store, 'claude', query, budget_chars=budget)
+                self.assertLessEqual(both['used_chars'], budget)
+                self.assertEqual(sorted(alone), sorted(r['id'] for r in both['records']))
+                for record in both['records']:
+                    # Each source keeps whole the passage it had without second passages.
+                    self.assertIn(alone[record['id']].split('\n\n', 1)[-1], record['text'])
+                    self.assertGreaterEqual(len(record['text']), len(alone[record['id']]))
+
+    def test_a_smaller_envelope_drops_second_passages_before_cutting_a_source(self):
+        filler = 'Satır satır kayıt tutulur, sütunlar sabit kalır. ' * 12
+        for index in range(5):
+            name = 'Zirkon Takvimi Kredi %d' % index
+            self.ingest('t%d' % index, '# %s\n\n## Özet\n\nZirkon takvimi kredi özeti %d.\n\n## Kayıtlar\n\n%s\n\n'
+                        '## Amaç\n\nZirkon takvimi kredi planı: sınır %d.\n' % (name, index, filler, index),
+                        'notes/t%d.md' % index, title=name)
+        context = passage.context_for(self.store, 'claude', 'zirkon takvimi kredi planı', budget_chars=5000)
+        self.assertTrue(all('kredi özeti' in r['text'] and 'kredi planı' in r['text']
+                            for r in context['records']))  # room for every second passage
+        primary = {r['id']: r['text'] for r in context.sources}
+        narrow = runtime.PackedContext(context)
+        narrow.sources = context.sources  # the same context without second passages
+        prefix = 'Receipt session=x\n'
+        for budget in (1200, 1800, 3000):
+            with self.subTest(budget=budget):
+                shown = json.loads(runtime.render_context(context, budget, prefix=prefix)[0][len(prefix):])['records']
+                alone = json.loads(runtime.render_context(narrow, budget, prefix=prefix)[0][len(prefix):])['records']
+                self.assertEqual([r['id'] for r in shown], [r['id'] for r in alone])
+                for record, without in zip(shown, alone):
+                    self.assertGreaterEqual(len(record['text']), len(without['text']))
+                    if not without.get('text_truncated') or without['text'] == primary[without['id']]:
+                        self.assertIn(primary[record['id']].split('\n\n', 1)[-1], record['text'])
+
+    def test_excerpt_joins_overlapping_windows_and_marks_gaps(self):
+        record = {'text': 'aaaa bbbb cccc dddd eeee'}
+        span = lambda head, start, end: (record, head, start, end, '')
+        self.assertEqual(passage._excerpt(record, [span('H', 10, 24), span('H', 0, 9)]),
+                         'H\n\naaaa bbbb\n\ncccc dddd eeee')  # only whitespace between: no gap
+        self.assertFalse(passage._partial(record, [span('H', 10, 24), span('H', 0, 9)]))
+        self.assertEqual(passage._excerpt(record, [span('H', 0, 14), span('H', 10, 24)]), 'H\n\naaaa bbbb cccc dddd eeee')
+        self.assertEqual(passage._excerpt(record, [span('H', 0, 4), span('H', 15, 24)]), 'H\n\naaaa\n\n[…]\n\ndddd eeee')
+        self.assertTrue(passage._partial(record, [span('H', 0, 4), span('H', 15, 24)]))
+
+    def test_status_gate_and_human_supersedes_references_apply_to_note_and_passage_reads(self):
+        self.ingest('old', 'Zirkon kovası eski karar.', 'knowledge/route-v1.md', status='superseded')
+        self.ingest('current', 'Zirkon kovası güncel karar.', 'knowledge/route-v2.md',
+                    supersedes=['[[knowledge/route-v1]]'])
+        self.ingest('waiting', 'Zirkon kovası bekleyen karar.', 'knowledge/waiting.md', status='waiting later')
+        # Equal scores and timestamps: the order is a tie, the gate is what is tested.
+        self.assertCountEqual([row['id'] for row in self.store.retrieve('zirkon kovası karar')['records']], ['waiting', 'current'])
+        self.assertEqual([row['id'] for row in self.strict('zirkon kovası karar', statuses=('active',))['records']], ['current'])
+
+    def test_ambiguous_supersedes_stem_does_not_retire_either_record(self):
+        self.ingest('first', 'Zirkon kovası ilk karar.', 'a/route.md')
+        self.ingest('second', 'Zirkon kovası ikinci karar.', 'b/route.md')
+        self.ingest('replacement', 'Zirkon kovası yeni karar.', 'knowledge/new.md', supersedes=['route'])
+        ids = [row['id'] for row in self.store.retrieve('zirkon kovası karar')['records']]
+        self.assertEqual(set(ids), {'first', 'second', 'replacement'})
+        _retired, dead = runtime.resolve_supersedes(self.store._eligible()[0])
+        self.assertEqual(dead[0]['value'], 'route')
+
+    def test_continuity_current_filters_out_archived_and_superseded_notes(self):
+        import serobeyinn_v3_continuity as continuity
+        self.ingest('archived-note', 'Archived content.', 'knowledge/archived.md', status='archived')
+        arch = [r for r in self.store._retrieve('', snapshot=True, statuses=['archived'], limit=10)['records'] if r['id'] == 'archived-note'][0]
+        saved = {
+            'version': 1, 'at': time.time(), 'project': None,
+            'refs': [{'id': arch['id'], 'revision': arch['revision'], 'source_sha256': arch['source_sha256']}]
+        }
+        self.assertEqual(continuity._current(self.store, saved), [])
+
+    def test_delivers_the_matching_block_of_a_rich_note(self):
+        self.ingest('rich', RICH, 'projects/kuzey.md')
+        self.ingest('other', 'Market listesi: elma, ekmek, zeytinyağı.', 'notes/market.md')
+        note_level = self.store.retrieve('yedekleme zirkon kovası hangisiydi', strict=True, budget_chars=5000)
+        # The #83 delivery failure: a whole-note match hands over the note's opening characters.
+        self.assertFalse(any(ANSWER in r['text'] for r in note_level['records']))
+        result = self.strict('yedekleme zirkon kovası hangisiydi', budget_chars=5000)
+        self.assertEqual([r['id'] for r in result['records']], ['rich'])
+        self.assertIn(ANSWER, result['records'][0]['text'])
+        self.assertTrue(result['records'][0]['text'].startswith('Kuzey deposu > Yedekleme\n\n'))
+        self.assertTrue(result['records'][0]['text_truncated'])
+
+    def test_a_note_sharing_every_word_does_not_outrank_the_answer(self):
+        self.ingest('rich', RICH, 'projects/kuzey.md')
+        log = '\n\n'.join(f'## Oturum {i}\n\nYedekleme konuşuldu. Zirkon anıldı. Kova yeniden ele alınacak. ' + FILLER
+                          for i in range(40))
+        self.ingest('archive', log, 'archive/oturumlar.md')
+        records = self.strict('yedekleme zirkon kovası hangisiydi')['records']
+        self.assertEqual(records[0]['id'], 'rich')
+
+    def test_a_long_chatty_prompt_is_not_ruled_out_for_its_length(self):
+        self.ingest('rich', RICH, 'projects/kuzey.md')
+        prompt = ('Bugün biraz yoğunum, önce elimdeki işi bitirelim sonra diğer konuya geçeriz. '
+                  'Yedekleme zirkon kovası hangisiydi? Kısaca özetle, gerekirse kaynağı da göster.')
+        records = self.strict(prompt)['records']
+        self.assertEqual([r['id'] for r in records], ['rich'])
+        self.assertIn(ANSWER, records[0]['text'])
+
+    def test_single_keyword_finds_a_passage_but_unrelated_prompts_abstain(self):
+        self.ingest('rich', RICH, 'projects/kuzey.md')
+        self.assertEqual(self.sources('zirkon'), ['projects/kuzey.md'])
+        for query in ('zirkon kuantum', 'teşekkürler harika oldu', 'bugün hava çok güzel'):
+            result = self.strict(query)
+            self.assertEqual(result['records'], [], query)
+            self.assertTrue(result['abstained'])
+
+    def test_empty_passage_result_is_an_answer_not_a_fallback(self):
+        # Two query words in different paragraphs: the whole note matches, no single block does.
+        text = 'Zirkon notu burada durur. ' + FILLER + '\n\n' + FILLER + ' Kobalt ise başka paragrafta.'
+        self.ingest('split', text, 'knowledge/split.md')
+        self.assertEqual([r['id'] for r in self.store.retrieve('zirkon kobalt', strict=True)['records']], ['split'])
+        self.assertEqual(self.sources('zirkon kobalt'), [])
+
+    def test_failure_falls_back_to_the_note_level_path(self):
+        self.ingest('rich', RICH, 'projects/kuzey.md')
+        self.ingest('short', 'Zirkon kovası yedekleme için seçildi.', 'knowledge/kisa.md')
+        expected = self.store.retrieve('zirkon kovası yedekleme', strict=True)
+        with patch.object(passage, 'context_for', side_effect=RuntimeError('boom')):
+            self.assertEqual(self.strict('zirkon kovası yedekleme'), expected)
+        self.store.STRICT_PASSAGES = False
+        self.assertEqual(self.strict('zirkon kovası yedekleme'), expected)
+
+    def test_gates_match_the_note_level_path(self):
+        self.ingest('old', 'Zirkon kovası yedekleme için eski karar.', 'knowledge/eski.md')
+        self.ingest('new', 'Zirkon kovası yedekleme için yeni karar.', 'knowledge/yeni.md', supersedes=['old'])
+        self.ingest('secret', 'Zirkon kovası yedekleme özel notu.', 'knowledge/ozel.md', visibility='private')
+        self.ingest('log', 'Zirkon kovası yedekleme günlüğü.', 'daily/2026-09-20.md')
+        self.ingest('stale', 'Zirkon kovası yedekleme bayat.', 'knowledge/bayat.md')
+        (self.vault / 'knowledge/bayat.md').write_text('değişti', encoding='utf-8')
+        result = self.strict('zirkon kovası yedekleme')
+        self.assertEqual([r['id'] for r in result['records']], ['new'])
+        self.assertEqual(result['stale_count'], 1)
+        self.assertEqual(result['citations'], [{'id': 'new', 'source': 'knowledge/yeni.md'}])
+
+    def test_project_words_do_not_count_as_matches(self):
+        self.ingest('a', 'Kuzey projesinde zirkon seçildi.', 'knowledge/a.md', project='kuzey')
+        self.assertEqual(self.sources('kuzey', project='kuzey'), [])
+        self.assertEqual(self.sources('kuzey zirkon', project='kuzey'), ['knowledge/a.md'])
+
+    def test_turkish_inflections_reach_the_passage(self):
+        self.ingest('lib', '# Arşiv\n\n' + FILLER + '\n\nKütüphane yedeklemesi her pazar alınır.', 'knowledge/lib.md')
+        self.assertEqual(self.sources('kütüphanenin yedeklemeleri'), ['knowledge/lib.md'])
+
+    def test_title_and_facts_only_record_stays_findable(self):
+        self.ingest('task', '', 'tasks/t.md', kind='task', status='active', title='Zirkon kovası yedekleme',
+                    facts={'owner': 'ops'})
+        self.assertEqual(self.sources('zirkon kovası yedekleme'), ['tasks/t.md'])
+
+    def test_advisor_signatures_see_the_same_records(self):
+        self.ingest('rich', RICH, 'projects/kuzey.md')
+        delivered = self.strict('yedekleme zirkon kovası hangisiydi')['records']
+        indexed = {r['id']: r for r in self.store._eligible()[0]}
+        self.assertEqual(advisor._signature(delivered), advisor._signature([indexed[r['id']] for r in delivered]))
+
+    def test_small_budget_keeps_one_passage_per_source(self):
+        for i in range(6):
+            self.ingest(f'n{i}', f'## Bölüm\n\nZirkon kovası yedekleme ayarı {i}. ' + FILLER, f'knowledge/n{i}.md')
+        result = self.strict('zirkon kovası yedekleme', budget_chars=1500)
+        ids = [r['id'] for r in result['records']]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertLessEqual(result['used_chars'], 1500)
+        self.assertLessEqual(len(ids), 5)
+
+    def test_hook_render_at_2000_keeps_the_whole_matching_passage(self):
+        # #81 touches the same packer: at the economical budget the best passage must still
+        # reach the prompt whole, even when four more candidates compete for the budget.
+        deep = '## Yedekleme\n\n' + 'Kova düzeni gece boyunca değişmeden çalışır. ' * 16 + ANSWER
+        self.ingest('deep', '# Kuzey deposu\n\n' + FILLER + '\n\n' + deep + '\n\n## Son\n\n' + FILLER, 'projects/kuzey.md')
+        for i in range(4):
+            self.ingest(f'o{i}', f'## Not {i}\n\nZirkon kovası yedekleme notu {i}. ' + FILLER, f'knowledge/o{i}.md')
+        context = self.strict('yedekleme zirkon kovası saati hangisiydi', budget_chars=2000)
+        self.assertGreaterEqual(len(context['records']), 1)
+        _text, delivered = runtime.render_context(context, 2000, prefix=HOOK_PREFIX)
+        self.assertEqual(delivered['records'][0]['id'], 'deep')
+        self.assertIn(ANSWER, delivered['records'][0]['text'])
+
+    def test_ranking_uses_source_frequency_not_block_count(self):
+        # kobalt fills 30 blocks of one note: rare across sources, common across blocks.
+        self.ingest('a', 'Pusula ayarı kobalt ile yapılır.', 'knowledge/a.md')
+        self.ingest('b', 'Pusula ayarı zirkon ile yapılır.', 'knowledge/b.md')
+        self.ingest('c', '\n\n'.join(f'Kobalt notu {i} ' + FILLER[:120] for i in range(30)), 'knowledge/c.md')
+        for name in 'def':
+            self.ingest(name, f'Zirkon kaydı {name}.', f'knowledge/{name}.md')
+        self.assertEqual(self.sources('pusula kobalt zirkon')[:2], ['knowledge/a.md', 'knowledge/b.md'])
+        # The same two passages ranked by block frequency would come out the other way round.
+        eligible, _ = self.store._eligible()
+        index = passage.build(self.store.state_dir, passage.pool(self.store, eligible), write=False)
+        by_id = {p[0]['id']: p for p in index.passages if p[0]['id'] in ('a', 'b')}
+        terms = runtime._tokens('pusula kobalt zirkon')
+
+        def block_rank(p):
+            shared = [t for t in terms if ' ' + t + ' ' in p[4]]
+            return passage._weight(shared, index.block_df, len(index.passages), p[4].count(' ') - 1)
+        self.assertGreater(block_rank(by_id['b']), block_rank(by_id['a']))
+
+    def test_frontmatter_is_metadata_never_passage_text(self):
+        from serobeyinn_v3_sync import SyncEngine
+        note = self.vault / 'knowledge/kuzey.md'
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text('---\ntitle: Kuzey yedekleme\nowner: fm-sahip-degeri\n---\n# Kuzey\n\n' + FILLER +
+                        '\n\n## Yedekleme\n\n' + ANSWER + '\n', encoding='utf-8')
+        engine = SyncEngine(self.vault, self.root / 'sync-runtime')
+        engine.sync()
+        records = engine.store.context_for('claude', 'yedekleme zirkon kovası hangisiydi', strict=True)['records']
+        self.assertEqual(len(records), 1)
+        self.assertIn(ANSWER, records[0]['text'])
+        for marker in ('fm-sahip-degeri', 'owner:', '---'):
+            self.assertNotIn(marker, records[0]['text'])
+
+
+class DedupeWiderTest(Vault):
+    """#530 regression: dedupe must retain the packer's wider and extension views of kept records."""
+
+    REPEAT = 12  # the whole source fits the 5,000 budget, so spare room takes it (#530)
+
+    def setUp(self):
+        super().setUp()
+        import serobeyinn_v3_dedupe
+        self.dedupe = serobeyinn_v3_dedupe
+        self.dedupe.save_settings(self.store.state_dir, True)
+        self.texts = {}
+        for index in range(2):
+            name = 'Zirkon Takvimi Kredi %d' % index
+            filler = 'Satır satır kayıt tutulur, sütunlar sabit kalır. ' * self.REPEAT
+            self.texts['wide%d' % index] = (
+                '# %s\n\n## Özet\n\nZirkon takvimi kredi özeti %d.\n\n## Kayıtlar\n\n%s\n\n'
+                '## Amaç\n\nZirkon takvimi kredi planı: sınır %d.\n' % (name, index, filler, index))
+            self.ingest('wide%d' % index, self.texts['wide%d' % index], 'notes/wide%d.md' % index, title=name)
+        self.context = self.strict('zirkon takvimi kredi planı', budget_chars=5000)
+        self.assertEqual(len(self.context['records']), 2)
+        self.assertEqual(set(self.context.wider), {'wide0', 'wide1'})
+        self.old, self.new = self.context['records']
+        self.dedupe.record_delivered(self.store.state_dir, 'claude', 'wider-session', [self.old])
+        self.assertTrue(self.dedupe._session_file(self.store.state_dir, 'claude', 'wider-session').is_file())
+
+    def filtered(self, context=None):
+        return self.dedupe.drop_delivered(self.store.state_dir, 'claude', 'wider-session',
+                                         self.context if context is None else context)
+
+    def expected_view(self, kept):
+        # Spare room takes the kept record's whole source: both passages, unclipped.
+        whole = kept.extensions[self.new['id']][0]
+        self.assertEqual(whole['text'], self.texts[self.new['id']])
+        return whole['text']
+
+    def test_real_passage_dedupe_render_retains_second_passage_within_budget(self):
+        kept, duplicates = self.filtered()
+        self.assertEqual([r['id'] for r in duplicates], [self.old['id']])
+        prefix = 'Receipt session=synthetic\n'
+        wire, delivered = runtime.render_context(kept, 5000, prefix=prefix)
+        shown = json.loads(wire[len(prefix):])
+        self.assertEqual([r['id'] for r in shown['records']], [self.new['id']])
+        self.assertEqual(shown['records'][0]['text'], self.expected_view(kept))
+        index = self.new['id'][-1]
+        for passage in ('kredi özeti %s.' % index, 'kredi planı: sınır %s.' % index):
+            self.assertIn(passage, shown['records'][0]['text'])
+        self.assertEqual(delivered['records'][0]['text'], shown['records'][0]['text'])
+        self.assertEqual(set(kept.wider), {self.new['id']})
+        self.assertEqual(set(kept.evidence), {self.new['id']})
+        self.assertLessEqual(set(kept.extensions), {self.new['id']})
+        self.assertEqual(set(delivered.evidence), {self.new['id']})
+        self.assertIsNot(kept.wider, self.context.wider)
+        serialized = json.loads(json.dumps(kept))
+        self.assertNotIn('wider', serialized)
+        self.assertNotIn('sources', serialized)
+        self.assertEqual([r['id'] for r in kept.sources], [self.new['id']])
+        self.assertNotIn(self.old['source'], wire)
+        self.assertNotIn('wider', shown)
+        self.assertNotIn('sources', shown)
+        self.assertNotIn('source_sha256', wire)
+        for budget in (5000, 1800, 900, 100, 0):
+            with self.subTest(budget=budget):
+                text, projection = runtime.render_context(kept, budget, prefix=prefix)
+                self.assertLessEqual(len(text), budget)
+                self.assertNotIn(self.old['source'], text)
+                self.assertTrue(all(r['id'] == self.new['id'] for r in projection['records']))
+                if text:
+                    json.loads(text[len(prefix):])
+
+    def test_repeated_and_all_filtered_do_not_retain_removed_wider_records(self):
+        kept, _ = self.filtered()
+        self.assertEqual(set(kept.wider), {self.new['id']})
+        repeated, duplicates = self.filtered(kept)
+        self.assertIs(repeated, kept)
+        self.assertEqual(duplicates, [])
+        self.assertEqual(set(repeated.wider), {self.new['id']})
+        self.dedupe.record_delivered(self.store.state_dir, 'claude', 'wider-session', [self.new])
+        empty, duplicates = self.filtered()
+        self.assertEqual(len(duplicates), 2)
+        self.assertEqual(empty.wider, {})
+        self.assertEqual(empty.sources, ())
+        wire, delivered = runtime.render_context(empty, 5000)
+        self.assertEqual(delivered['records'], [])
+        self.assertNotIn('notes/wide', wire)
+        # Cloning/filtering cannot mutate the caller's process-local metadata.
+        self.assertEqual(set(self.context.wider), {'wide0', 'wide1'})
+
+    def test_plain_dict_compatibility_without_process_local_metadata(self):
+        ordinary = dict(self.context)
+        kept, duplicates = self.filtered(ordinary)
+        self.assertIs(type(kept), dict)
+        self.assertEqual([r['id'] for r in kept['records']], [self.new['id']])
+        self.assertEqual([r['id'] for r in duplicates], [self.old['id']])
+        self.assertFalse(hasattr(kept, 'wider'))
+        self.assertEqual(len(ordinary['records']), 2)
+
+
+class DedupeWiderOnlyTest(DedupeWiderTest):
+    """#574 as landed: without room for the whole source, the second passage survives dedupe."""
+
+    REPEAT = 120  # each source is longer than the whole 5,000 budget
+
+    def expected_view(self, kept):
+        self.assertEqual(kept.extensions, {})
+        text = self.context.wider[self.new['id']]['text']
+        self.assertIn('[…]', text)
+        return text
+
+
+class ConfigAndCacheTest(Vault):
+    def test_configured_floor_and_exclusions(self):
+        self.ingest('arch', 'Zirkon kovası yedekleme arşiv kaydı.', '📦 900-Archive/eski.md')
+        self.assertEqual(self.sources('zirkon kovası yedekleme'), ['📦 900-Archive/eski.md'])
+        self.configure(strict_exclude=['📦 900-Archive/'])
+        self.assertEqual(self.sources('zirkon kovası yedekleme'), [])
+        self.configure(strict_floor=1.9)
+        self.assertEqual(self.sources('zirkon kovası yedekleme'), [])
+        (self.store.state_dir / passage.CONFIG_NAME).write_text('{not json', encoding='utf-8')
+        self.assertEqual(self.sources('zirkon kovası yedekleme'), ['📦 900-Archive/eski.md'])  # invalid: defaults
+        self.configure(strict_exclude=['📦 900-ARCHIVE\\'], strict_floor='x')
+        # The list extends V3's own paths; it cannot drop them. Windows separators and case fold.
+        self.assertEqual(passage.settings(self.store.state_dir),
+                         {'floor': passage.FLOOR, 'exclude': ('daily/', 'receipts/', '📦 900-ARCHIVE/')})
+        self.assertEqual(self.sources('zirkon kovası yedekleme'), [])
+        self.configure(strict_exclude=[])
+        self.ingest('log', 'Zirkon kovası yedekleme günlük kaydı.', 'daily/2026-09-21.md')
+        self.assertEqual(self.sources('zirkon kovası yedekleme'), ['📦 900-Archive/eski.md'])
+
+    def test_exclusion_matches_decomposed_unicode_paths(self):
+        decomposed = unicodedata.normalize('NFD', 'Arşiv Öğeleri/eski.md')
+        self.ingest('arch', 'Zirkon kovası yedekleme arşiv kaydı.', decomposed)
+        self.assertEqual(self.sources('zirkon kovası yedekleme'), [decomposed])
+        self.configure(strict_exclude=[unicodedata.normalize('NFC', 'arşiv öğeleri/')])
+        self.assertEqual(self.sources('zirkon kovası yedekleme'), [])
+
+    def test_cache_is_json_private_and_rebuilt_when_damaged_or_foreign(self):
+        self.ingest('rich', RICH, 'projects/kuzey.md')
+        first = self.strict('yedekleme zirkon kovası hangisiydi')
+        cache = self.store.state_dir / passage.CACHE_NAME
+        blob = json.loads(cache.read_text(encoding='utf-8'))
+        self.assertEqual((blob['version'], blob['params']), (passage.CACHE_VERSION, passage._PARAMS))
+        if os.name == 'posix':
+            self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+        cache.write_bytes(b'\x80\x04garbage')  # a pickle header is just bytes to a JSON reader
+        self.assertEqual(self.strict('yedekleme zirkon kovası hangisiydi'), first)
+        self.assertEqual(json.loads(cache.read_text(encoding='utf-8'))['version'], passage.CACHE_VERSION)
+        blob['params'] = [passage.BLOCK_TARGET, passage.BLOCK_OVERLAP, 'another-tokenizer']
+        blob['records'] = {key: [['sahte', 0, 5, 'zirkon kova yedekleme']] for key in blob['records']}
+        cache.write_text(json.dumps(blob), encoding='utf-8')
+        self.assertEqual(self.strict('yedekleme zirkon kovası hangisiydi'), first)
+
+    def test_cache_from_an_older_stemmer_is_rebuilt(self):
+        # 3.11.0 wrote its own stems ("kurulmas") under a probe the #430 rules leave intact.
+        old_probe = 'Kütüphanesindeki notlarımızı güncellediler; running tests quickly İstanbul ŞEHİR 2026'
+        old_params = [passage.BLOCK_TARGET, passage.BLOCK_OVERLAP,
+                      hashlib.sha256(' '.join(sorted(runtime._tokens(old_probe))).encode()).hexdigest()[:16]]
+        self.ingest('mem0', 'Mem0 kurulmasın; yerel hafıza yeterli.', 'knowledge/mem0.md')
+        self.assertEqual(self.sources('Mem0 kurulmalı mı'), ['knowledge/mem0.md'])
+        cache = self.store.state_dir / passage.CACHE_NAME
+        blob = json.loads(cache.read_text(encoding='utf-8'))
+        blob['params'] = old_params
+        blob['records'] = {key: [[head, start, end, ' '.join('kurulmas' if t == 'kurul' else t for t in tokens.split()),
+                                  head_only]
+                                 for head, start, end, tokens, head_only in entries]
+                           for key, entries in blob['records'].items()}
+        blob.pop('pool', None)
+        cache.write_text(json.dumps(blob), encoding='utf-8')
+        self.assertEqual(self.sources('Mem0 kurulmalı mı'), ['knowledge/mem0.md'])
+
+    def test_cache_from_the_3_12_stemmer_is_rebuilt(self):
+        # 3.12.0 kept "calisir" whole under a probe the active verb rule (#430) leaves intact.
+        probe = 'Kütüphanesindeki notlarımızı güncellediler; running tests quickly İstanbul ŞEHİR 2026 kurulmalı metni claude'
+        old_params = [passage.BLOCK_TARGET, passage.BLOCK_OVERLAP,
+                      hashlib.sha256(' '.join(sorted(runtime._tokens(probe))).encode()).hexdigest()[:16]]
+        self.assertNotEqual(old_params, passage._PARAMS)
+        self.ingest('zirkon', 'Zirkon servisi her gece çalışır.', 'knowledge/zirkon.md')
+        self.assertEqual(self.sources('zirkon çalışıyor mu'), ['knowledge/zirkon.md'])
+        cache = self.store.state_dir / passage.CACHE_NAME
+        blob = json.loads(cache.read_text(encoding='utf-8'))
+        blob['params'] = old_params
+        blob['records'] = {key: [[head, start, end, ' '.join('calisir' if t == 'calist' else t for t in tokens.split()),
+                                  head_only]
+                                 for head, start, end, tokens, head_only in entries]
+                           for key, entries in blob['records'].items()}
+        blob.pop('pool', None)
+        cache.write_text(json.dumps(blob), encoding='utf-8')
+        self.assertEqual(self.sources('zirkon çalışıyor mu'), ['knowledge/zirkon.md'])
+
+    def test_changed_record_is_reindexed(self):
+        self.ingest('a', 'Zirkon kovası için karar.', 'knowledge/a.md')
+        self.assertEqual(self.sources('kobalt deposu'), [])
+        self.store.update_task('a', 1, {'text': 'Kobalt deposu için karar.'})
+        self.assertEqual(self.sources('kobalt deposu'), ['knowledge/a.md'])
+
+    def test_cold_index_is_built_in_bounded_steps(self):
+        for i in range(3):
+            self.ingest(f'n{i}', f'# Not {i}\n\n' + FILLER + f'\n\n## Yedekleme\n\nZirkon kovası yedekleme ayarı {i}.',
+                        f'knowledge/n{i}.md')
+        note_level = self.store.retrieve('zirkon kovası yedekleme', strict=True)
+        cache = self.store.state_dir / passage.CACHE_NAME
+        with patch.object(passage, 'BUILD_SECONDS', -1.0):  # every call may tokenise one record only
+            for step in (1, 2):
+                self.assertEqual(self.strict('zirkon kovası yedekleme'), note_level)  # pending: old path
+                blob = json.loads(cache.read_text(encoding='utf-8'))
+                self.assertEqual((len(blob['records']), 'pool' in blob), (step, False))
+            finished = self.strict('zirkon kovası yedekleme')
+        self.assertIn('pool', json.loads(cache.read_text(encoding='utf-8')))
+        self.assertNotEqual(finished, note_level)
+        self.assertEqual(finished, self.strict('zirkon kovası yedekleme'))
+        self.assertTrue(all(r['text'].lstrip('# ').startswith('Not ') for r in finished['records']))
+
+
+class BenchmarkTest(unittest.TestCase):
+    def test_synthetic_benchmark_passages_beat_note_level_without_new_noise(self):
+        spec = importlib.util.spec_from_file_location('v3_passage_bench', ROOT / 'scripts/evaluate_v3_passages.py')
+        bench = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bench)
+        report = bench.evaluate(budgets=(2000,))
+        self.assertEqual(report['questions'], 42)
+        note, passages = report['arms']['note_level']['2000'], report['arms']['passage_level']['2000']
+        self.assertGreaterEqual(passages['short']['answerable'], note['short']['answerable'] + 0.15)
+        self.assertGreaterEqual(passages['long']['answerable'], note['long']['answerable'] + 0.10)
+        self.assertEqual(passages['noise_everyday'], 0.0)
+        self.assertLessEqual(passages['noise_agent'], 0.1)
+
+
+if __name__ == '__main__':
+    unittest.main()

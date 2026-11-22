@@ -1,0 +1,558 @@
+# Birden çok makinede kullanım
+
+SeroBeyinn yerel önceliklidir: makineler arasında senkron kodu yoktur ve SeroBeyinn git kurmaz
+([UPDATE](UPDATE.md)). Aynı vault'u iki bilgisayarda (ör. iş ve ev) git gibi bir araçla
+eşitliyorsan bu belge hangi dosyaların eşitleneceğini ve iki makinenin aynı gün nasıl
+çalışacağını anlatır ([#112](https://github.com/BeNKaYS/SeroBeyinn/issues/112)).
+
+Her makine SeroBeyinn'i kendisi kurar ve günceller. Runtime (SQLite veritabanı) vault dışında,
+makineye özeldir ve eşitlenmez; her makine onu vault'taki Markdown'dan kendisi kurar.
+
+## Doctor: Git'te izlenen makine dosyaları
+
+`python3 serobeyinn.py doctor` (ve `--human` görünümü) `tracked_machine_files` alanında
+sabit bir kurulum yolu listesinin Git indeksinde izlenip izlenmediğini salt okunur
+bildirir: runtime pini, `SeroBeyinn Guncelle.cmd`, bilinen hook/adaptör dosyaları, Codex
+ayarı ve emekli runner yolları. Bu, bütün yönetilen dosyaların veya kullanıcı betiklerinin taraması
+değildir; denetlenen kurulum dosyalarının içeriği okunmaz, Git takibi veya ayarlar
+değiştirilmez.
+Git yoksa/depo değilse `skipped`; erişim, zaman aşımı, desteklenmeyen Git veya
+sparse checkout/index durumunda `unavailable` raporlanır, temiz sonuç sayılmaz.
+Kontrol ağ erişimi yapmaz. Uyarı bilgi amaçlıdır; doctor genel durumunu veya
+zamanlanmış kontrolün hata politikasını değiştirmez. Geçişte her makinenin kendi
+yedeğini koruyun; bu belge bir otomatik untrack veya başka makinenin dosyalarını
+kopyalama talimatı değildir.
+
+## Ne eşitlenir
+
+| Yol | Git'e girer mi | Neden |
+|---|---|---|
+| Notlar ve companion dosyaları | evet | Markdown kaynak gerçektir. |
+| `.serobeyinn-daily-layout.json` | evet | `preferences --daily-layout flat\|v3` vault'un ortak görünüm yolunu seçer. Aynı vault'a yazan makineler aynı tercihi ve bu seçeneği destekleyen motor sürümünü kullanmalıdır. |
+| `.serobeyinn-workspaces.json` | evet | `workspace` komutlarının üstverisidir (ad, tür, yaşam döngüsü, provision durumu). Klasör bağlantıları `.serobeyinn-projects.json` içinde kalır; ikisi birlikte eşitlenmelidir. |
+| `🔮 850-Companion/Arşiv/` | evet | `companion-compact` metni canlı dosyadan çıkarıp arşive taşır ve yerine tek bir işaret satırı bırakır. Arşiv tek makinede kalırsa öbür makine içi boş bir işaret görür. Arşivdeki `visibility: private` otomatik bağlama girmez demektir, git dışı demek değildir. |
+| `receipts/` | evet | Receipt dosyası yazıldıktan sonra değişmez ve adı `event_id` özetidir (`serobeyinn_v3_sync.py` `receipt()`). Öbür makine yeni receipt'i bir sonraki `sync`'te kendi veritabanına alır (`_scan_receipts()`). |
+| `receipts/*.md.view-provenance.json` | evet | Bir receipt'in üretilmiş görünüme dayandığı için dışlandığını, immutable olay kimliğiyle kaydeder. State yeniden kurulunca eski receipt dışarıda kalır; aynı günlük yoluna dayanan yeni insan receipt'leri engellenmez. İçerik taşımaz; bu dosyalar silinmemelidir. |
+| `.presence/` | yalnız `parallel-sessions` açıksa | Açık oturumlar için kısa ömürlü JSON işaretleridir. Oturum kimliği ve zaman damgaları taşır; istem metni ya da çalışma klasörü taşımaz. Git ya da bulut eşitlemesi, bu metadata'yı da taşır. |
+| `knowledge/conversations/` | yalnız chat trace açık ve özet yazılmışsa | Kullanıcı/ajan konuşmasından üretilen Markdown özetleridir; not metni gibi eşitlenir ve içerik taşıyabilir. |
+| `daily/v3/`, `knowledge/v3/` | hayır | Bu görünümler yerel veritabanındaki receipt'lerden üretilir (`serobeyinn_v3_projections.py` `project_receipts()`). Receipt'ler eşitlendiyse aynı saat dilimindeki iki makinede aynı çıkar; dosya adı makinenin yerel günüdür, farklı saat dilimindeki makineler aynı receipt'i farklı güne koyabilir. Git'e alınırlarsa öbür makineden gelen dosya elle düzenlenmiş sayılır (`manual receipt view edit preserved`) ve o görünüm artık güncellenmez. |
+| `AGENTS.md`, `CLAUDE.md` | evet | Kullanıcının kendi talimatları da bu dosyalardadır. 3.7.0'dan beri SeroBeyinn bloğu makine yolu taşımaz (`python3 serobeyinn.py sync`), aynı sürümü kuran her makinede aynıdır. Önce güncelleyen makinenin bloğu git'le öbürüne gelirse öbür makinenin güncellemesi onu kendi bloğu sayar ve çakışma vermez. |
+| Kurulum dosyaları | hayır | Bir kısmı bu makinenin yollarını taşır (`.serobeyinn-runtime.json`, hook dosyaları, Hermes ve OMP eklentileri); geri kalanı bu makinede kurulu sürüme aittir. Güncellemeyi önce yapan makinenin dosyaları git'le öbürüne geçerse o makinenin kurulum kaydıyla uyuşmaz; yeniden kurulum `Reinstall conflict: managed file changed` hatasıyla durur. |
+
+`--daily-layout flat` seçildiğinde üretilen günlükler `daily/YYYY-MM-DD.md` içindedir.
+İnsan günlükleri de burada bulunabildiği için tüm `daily/` klasörünü Git dışında bırakma;
+yalnız üretilen dosyaları ayır. Yerel gün ve saat dilimi kuralı iki düzende de aynıdır.
+Ayrıntılar [günlük receipt düzeninde](PREFERENCES.md#günlük-receipt-düzeni).
+
+### Gizlilik seçimi
+
+Git ve bulut eşitleme vault içindeki dosya yollarına göre çalışır; `visibility: private`
+otomatik bağlama girmeyi engeller, dosyayı Git veya OneDrive/iCloud/Dropbox dışına çıkarmaz.
+Paylaşılan depoya göndermeden önce `git status --short` ile bu yolları kontrol et.
+
+Çapraz cihazdaki açık-oturum uyarısına ihtiyacın yoksa `.gitignore` dosyana şunu ekleyebilirsin:
+
+```gitignore
+.presence/
+```
+
+Bu seçim başka cihazdaki açık oturumların görünmesini engeller. Konuşma özetlerini yerel
+tutmak istiyorsan ayrıca şunu ekle:
+
+```gitignore
+knowledge/conversations/
+```
+
+Bu ikinci seçim, yeni özetlerin Git'e eklenmesini önler; zaten izlenen dosyaları izlemeyi
+bırakmaz. Bulut eşitleme kullanıyorsan eşdeğer hariç tutmayı o hizmette ayrıca ayarla.
+Özetleri veya presence işaretlerini başka cihazda kullanmak istiyorsan bu satırları ekleme.
+
+## Önerilen `.gitignore`
+
+```gitignore
+# SeroBeyinn kurulumu: her makine SeroBeyinn'i kendisi kurar ve günceller
+.serobeyinn-runtime.json
+.serobeyinn-version
+serobeyinn.py
+SeroBeyinn Guncelle.cmd
+.claude/settings.local.json
+.claude/scripts/
+.claude/hermes-plugin/
+.claude/skills/serobeyinn/
+.claude/skills/serobeyinn-doktor/
+.claude/skills/serobeyinn-guncelle/
+.claude/skills/serobeyinn-kontrol/
+.agents/hooks.json
+.agents/skills/serobeyinn/
+.agents/skills/serobeyinn-doktor/
+.agents/skills/serobeyinn-guncelle/
+.agents/skills/serobeyinn-kontrol/
+.codex/config.toml
+.codex/hooks.json
+.kiro/hooks/serobeyinn-v3.json
+.kiro/skills/serobeyinn/
+.kiro/skills/serobeyinn-doktor/
+.kiro/skills/serobeyinn-guncelle/
+.kiro/skills/serobeyinn-kontrol/
+.opencode/plugins/serobeyinn-v3.js
+.omp/hooks/pre/serobeyinn-v3.ts
+# companion-compact süreçler arası kilidi; kalıcıdır ama kullanıcı verisi değildir
+**/.serobeyinn-compact.lock
+# Aynı makinedeki not yazarlarının yerel kilidi, istekleri ve tam bayt yedekleri
+.serobeyinn-note-write/
+# Yerel veritabanından üretilen görünümler: her makine kendisininkini üretir
+daily/v3/
+knowledge/v3/
+```
+
+Kontrol: kurulumdan ya da güncellemeden hemen sonra `git status --short` boş olmalıdır.
+
+### Aynı klasörde kullanıcı betikleri varsa
+
+Yukarıdaki `.claude/scripts/` satırı klasörün tamamını dışlar; kendi senkron betiğin de
+buradaysa onu Git'e eklemeyi engeller. Listeyi olduğu gibi uygulamadan önce klasördeki
+kullanıcı dosyalarını ayır. Örneğin yalnız `kendi-senkron.py` dosyanı eşitlemek istiyorsan,
+`.claude/scripts/` satırını şu iki satırla değiştir:
+
+```gitignore
+.claude/scripts/*
+!.claude/scripts/kendi-senkron.py
+```
+
+Burada klasörün kendisi dışlanmadığı için ikinci satır o dosyayı yeniden dahil edebilir.
+Üst klasörü dışlayan başka bir kural varsa onu da incele;
+`git check-ignore -v -- .claude/scripts/kendi-senkron.py` hangi kuralın eşleştiğini gösterir. `!` ile başlayan
+eşleşme dahil etme kuralıdır; dosyanın eklenebildiğini `git status --short` ile doğrula.
+Örnek dosya adını kendi dosyanla değiştir; yönetilen motor dosyalarını bu istisnaya ekleme.
+Yalnız `serobeyinn_v3*.py` desenini dışlamak tüm kurulum dosyalarını kapsamaz: örneğin eski
+kurulumlardan kalan `compile.py` ve `flush.py` emekli kabukları da yönetilebilir.
+
+### Daha önce izlenen kurulum dosyalarını ayırmak
+
+`.gitignore` eklemek Git'in zaten izlediği dosyaları takipten çıkarmaz. `git rm --cached`
+seçilen dosyayı bu çalışma kopyasında bırakır, fakat silme kaydı commit edilince **diğer
+klonlarda bir sonraki pull o izlenen dosyayı silebilir**. Yerel değişiklik varsa Git bunun
+yerine pull'u durdurabilir; her iki durumda da kurulumu kontrol etmeden devam etme.
+
+1. Değişikliği paylaşmadan ve diğer makinelerde pull yapmadan **önce**, her makinede o
+   makinenin vault'unu ve vault dışındaki state klasörünü ayrı bir yere yedekle. Yedekler
+   Git'e ya da ortak senkron klasörüne girmesin. Makineye özgü yolları taşıyan dosyaları
+   başka makinenin kopyasıyla değiştirme.
+2. `git ls-files -- .serobeyinn-runtime.json .claude/settings.local.json .codex/hooks.json`
+   gibi hedefli bir komutla izlenen dosyaları kontrol et; bu örnek tam liste değildir.
+   Yukarıdaki listeyi kendi kurulumunla karşılaştır, kullanıcı betiklerini ve özel hook
+   girdilerini koru. Yalnız seçtiğin kurulum dosyalarını `git rm --cached -- DOSYA` ile
+   takipten çıkar; tüm vault'u topluca takipten çıkarma. Commit öncesi staged diff'i incele.
+3. Her makinede pull sonrasında silinen makine dosyalarını **o makinenin kendi yedeğinden**
+   geri koy veya doğrulanmış SeroBeyinn paketinin kurucusunu bu makinede yeniden çalıştır.
+   `serobeyinn.py` de silinmiş olabileceğinden paket içindeki `scripts/install_v3.py` girişini
+   kullanabilirsin; mevcut vault yolunu ve bu makinenin mevcut state yolunu ver.
+   Başka makinenin `v3-install.json` kaydını kopyalamak bu geçişin desteklenen yolu değildir.
+   Yerel state kaydı yoksa ya da kurucu çakışma bildirirse dosyaları ezerek aşma; aşağıdaki
+   [taşıma sınırlarını](#vaultu-başka-klasöre-ya-da-hesaba-taşımak) incele.
+4. Bu makinede `python3 serobeyinn.py doctor` çalıştır; Windows'ta `py -3 serobeyinn.py doctor`
+   kullan. Etkin state ve `hook_paths` bulgularını incele, özel hook girdilerinin korunduğunu
+   ve `git status --short` çıktısında beklenmedik silme/değişiklik olmadığını doğrula.
+
+Bu geçiş Git dosya takibini ayırır; doctor'ın izlenen tüm makine dosyalarını otomatik
+bulduğu anlamına gelmez ([#539](https://github.com/BeNKaYS/SeroBeyinn/issues/539)).
+
+`.serobeyinn-runtime.json` yine de başka bir işletim sisteminden geldiyse (Windows'ta `C:\...`,
+macOS ya da Linux'ta `/...` yolu) bu makinede mutlak bir yol değildir. `serobeyinn.py` o zaman bu
+makinenin varsayılan state dizinini kullanır; her komut bunu stderr'e tek satırla söyler
+(stdout ve `--json` çıktısı değişmez) ve `doctor` `pinned_state_not_absolute` olarak gösterir.
+Böyle bir vault'un hook dosyaları da öbür makinenin yollarını taşır; `doctor` onları `hook_paths`
+altında listeler, bu makinede kurulum ikisini birlikte düzeltir. Kurucu da böyle bir yolu değişmiş dosya saymaz, bu makinenin yoluyla yeniden
+yazar ([#249](https://github.com/BeNKaYS/SeroBeyinn/issues/249)). 3.8.1 ve öncesinin
+`serobeyinn.py`'si bu yolu okuyamadığı için `serobeyinn.py update` çalışmaz; bir kez yeni paketin
+kurucusunu çalıştır (`python3 scripts/install_v3.py --vault "<vault>"`; bu makinede özel
+state kullandıysan `--state` ile onu ver), sonra dosyayı `.gitignore`'a ekle.
+
+Aynı veya farklı işletim sisteminden (Windows, Linux, macOS) ya da başka bir kullanıcı hesabından
+gelen varsayılan state yolları (`AppData/Local/serobeyinn-v3/<vault-hash>`, `.local/state/serobeyinn-v3/<vault-hash>`
+veya `Library/Application Support/serobeyinn-v3/<vault-hash>`) yabancı pin sayılır; CLI ve lifecycle hook bu
+makinenin ve kullanıcının yerel varsayılan state dizinine geri döner. Özel `--state` dizinleri bu
+sezgisel eşlemeden etkilenmez; taşınan vault'ta `doctor` ile pin ve etkin state'i ayrıca doğrula.
+
+`companion-compact` kilit dosyasını companion klasöründe kalıcı bırakır. Dosyanın
+silinmemesi, POSIX üzerinde kilit tutulurken aynı yolda yeni bir inode açılmasını önler.
+Kilit yalnız aynı paylaşılan dosya sistemini gören süreçleri koordine eder; senkronizasyon
+araçlarıyla çoğaltılmış ayrı çalışma kopyaları ve kilit semantiği sunmayan NFS/SMB
+kurulumları bu garantinin dışındadır.
+
+- **3.6.0 ve öncesi:** O sürümlerde blok bu makinenin mutlak komut yolunu taşıyordu. İki makine
+  de 3.7.0'a geçene kadar `AGENTS.md`'yi (bloğu kendisi taşıyorsa `CLAUDE.md`'yi de) `.gitignore`'da
+  tut; ikisi de güncellenince satırı kaldırabilirsin.
+- Kendi skill'lerin, `.claude/settings.json` veya başka istemci ayarların bu listede yoktur;
+  onları eşitleyip eşitlememek senin kararın.
+
+## Önerilen `.gitattributes`
+
+```gitattributes
+# Receipt dosyaları bayt bayt karşılaştırılır: satır sonu dönüştürülmez
+receipts/** -text
+# Kart ve kayıt düzenindeki companion dosyaları: iki makinenin eklemeleri birlikte kalır
+**/Last-Session.md merge=union
+**/Journal.md merge=union
+**/Arşiv/*.md merge=union
+```
+
+**`receipts/** -text`:** Git for Windows varsayılanı `core.autocrlf=true`, eşitlenen
+receipt kaynaklarını CRLF'ye çevirebilir. Güncel motor yalnız satır sonu farkını aynı
+receipt kabul eder; eski istemciler bayt karşılaştırması nedeniyle çakışma bildirebilir.
+Bu satır gereksiz bayt değişikliklerini ve eski istemci sorunlarını önler; `eol=lf` de
+kullanılabilir.
+
+**`merge=union`:** Git iki tarafın satırlarını da tutar, çakışma çıkarmaz. Satır silmez ama
+çift bırakabilir. Bu yüzden yalnız yeni kaydın eklendiği dosyalar için uygundur:
+oturum başına kartlı `Last-Session.md`, `Journal.md` ve arşiv. `Threads.md`, `Kurallar.md`
+ve `Core.md` bilerek listede değil. Bu dosyalarda bir bilginin tek güncel hali vardır;
+iki makine aynı satırı değiştirirse görünür bir çakışma, sessizce yan yana kalan iki
+çelişkili satırdan iyidir.
+
+Union ile birleşen kartların sırası zamana göre olmayabilir ve iki kart arasındaki boş satır
+tekilleşebilir. `companion-compact` kartları konumlarına değil başlıktaki tarih ve saate
+göre sıralar, en yenisini korur.
+
+## Aynı gün iki makinede çalışmak
+
+- **Last-Session:** her oturum kendi kartını açar ve yalnız onu düzenler
+  ([companion protokolü](COMPANION-PARITY.md)). İki makinenin kartları union ile birleşir.
+- **Threads, Kurallar, Core:** ilgili bölüm yerinde düzenlenir. Git çakışma verirse güncel
+  olanı elle seç.
+- **Git adımları:** çalışmaya başlamadan önce `pull`; bitince `commit`, `pull --rebase`,
+  `push`. Aynı vault'ta birden çok oturum açıksa git komutlarını aynı anda birden çok
+  oturumdan çalıştırma; bir oturumdan ya da günün sonunda tek seferde gönder.
+- **Paralel oturumlar ve çapraz cihaz farkındalığı:** `preferences --parallel-sessions on` açıkken ajan,
+  aynı vault'ta son 45 dakikada etkin başka bir oturum varsa ilk isteminde tek satırlık bir
+  uyarı alır ([PREFERENCES.md](PREFERENCES.md#paralel-oturum-bildirimi)). Oturumlar vault kökündeki
+  hafif `.presence/<session_id[:24]>.json` dosyaları ve makine-yerel runtime işaretleri ile
+  senkronize edilir; oturum kapandığında (`SessionEnd`) dosya temizce silinir, 45 dakikadan eski
+  işaretler otomatik elenir ([#205](https://github.com/BeNKaYS/SeroBeyinn/issues/205)).
+- **Çakışma çözülmeden oturum açma:** `pull --rebase` çakışmada durduğunda dosyada
+  `<<<<<<<`, `=======`, `>>>>>>>` işaretleri kalır. `sync` bu üç işareti sırayla taşıyan
+  dosyayı (receipt dahil) indekslemez ve `unresolved git conflict markers` uyarısıyla `degraded`
+  döner; dosya çözülene kadar bağlamdan çıkar ([#205](https://github.com/BeNKaYS/SeroBeyinn/issues/205)).
+  Kod bloğundaki işaretler de sayılır: notta alıntılanmış bir çakışma örneği de uyarı verir. Önce çakışmayı çöz (`git status` temiz olmalı), sonra
+  oturum aç.
+- **Dosya senkron servisinin çakışma kopyaları:** iCloud, Dropbox, Syncthing, Google Drive gibi
+  servisler çakışmada iki tarafı iki dosya olarak bırakır ([#205](https://github.com/BeNKaYS/SeroBeyinn/issues/205)).
+  `sync` hiçbir dosyayı taşımaz, silmez ya da yeniden adlandırmaz; hangi tarafın doğru olduğuna
+  sen karar verirsin.
+  - Servisin kendi damgasını taşıyan kopya (`Not (… conflicted copy …).md`, `Not (Case Conflict).md`,
+    `Not.sync-conflict-20261006-120000-ABCDEF7.md`) indekse alınmaz; `file sync conflict copy`
+    uyarısıyla `degraded` döner. Asıl not normal indekslenir.
+  - Numaralı ad (`Not 2.md`, `Not (1).md`) aynı klasörde `Not.md` varken yalnız listelenir:
+    `sync_copy_candidates` alanında iki dosya ve içeriklerinin aynı olup olmadığı (`same_content`)
+    görünür, ikisi de indekste kalır ve sync durumu değişmez. Böyle adlandırılmış gerçek bir not
+    (`Sezon 2.md`) düşmez; listeden çıkarmak için adını değiştir. Kopya notun `id`'sini de taşıyorsa
+    iki dosya ayrıca `duplicate source id` çakışmasıyla bağlamdan çıkar.
+  - `receipts/` altında `<özet>.md` adına eklenmiş her şey (`<özet> 2.md`, `<özet> (conflicted copy).md`)
+    receipt kopyasıdır: indekslenmez, `file sync copy of a receipt` uyarısıyla görünür. Receipt'ler
+    yalnız eklenir; kopyayı asılla karşılaştırıp sil.
+- **Receipt `event_id`'sini makineler arasında tekil tut:** `event_id`'yi ajan seçer ve dosya
+  adı onun özetidir. İki makine aynı gün aynı konuya aynı adı verirse (`ortak-konu-2026-09-27`)
+  iki farklı receipt aynı dosyaya düşer ve `pull --rebase` `CONFLICT (add/add)` ile durur.
+  Çakışma bir tarafın dosyası seçilerek çözülürse öbür makinenin veritabanında kendi özeti
+  kalır; `sync` uyarı vermez ve iki makinenin görünümleri sessizce ayrışır. Bunu önlemek için
+  `event_id`'nin sonuna kart başlığındaki gibi `Receipt session=` değerinin ilk 8 karakterini
+  ekle: `ortak-konu-2026-09-27-3f9a1c2b`.
+
+## Aynı makinede birden çok ajan
+
+Claude Code ve Codex aynı vault'taki insan yazımı notları düzenlerken doğrudan
+dosya yazmak yerine `note-read` ve `note-edit` kullanır. Last-Session.md, Threads.md,
+Journal.md ve proje notları bu akışa dahildir. Görevler için revision kontrollü
+`task-update`, receipt ve üretilen görünümler için kendi V3 komutları kullanılır.
+
+```text
+python3 serobeyinn.py note-read "proje/Threads.md"
+python3 serobeyinn.py note-edit --file istek.json
+```
+
+Yalnız mevcut notun SHA-256 değerini almak için `note-read "proje/Threads.md" --sha-only` kullanabilirsin. Bu seçenek JSON çıktısında `source`, `exists`, `sha256` alanlarını korur; `content` alanını göndermez. Dosya okuma ve kaynak doğrulamaları değişmez. Eksik kaynak için `exists: false`, `sha256: null` döner; `--must-exist` ile birlikte de kullanılabilir. Bu seçenek güncel içeriği okumadan eski düzenlemeleri güvenli hale getirmez; bir çakışma sonrası hedef metni yeniden oku.
+
+Windows'ta `python3` yerine `py -3` kullan. `note-read` JSON olarak `source`,
+`exists`, `sha256`, `content` verir; dosya yoksa `exists: false` olur, son iki alan
+`null` olur ve çıkış 0'dır, böylece not `note-edit` ile oluşturulabilir. Dosyanın
+var olması gerekiyorsa `--must-exist` ekle: eksik dosya `error` (`FileNotFoundError`)
+ve çıkış 1 verir. `source`, mevcut
+dosya ve üst klasörlerin diskteki gerçek yazımıdır; büyük/küçük harf veya Windows
+kısa ad takma adıyla istek verilmişse girişten farklı olabilir. Sonraki istekte
+bu dönen yolu kullan. Kanonik yol için yönetilen, gizli ve hariç tutulan kaynak
+kuralları yeniden denetlenir. `content`, UTF-8 BOM
+ve CRLF dahil okunan metni korur; hash ham baytların SHA-256 özetidir. İsteği bu
+okumadan oluştur, satır sonlarını dönüştürme:
+
+```json
+{"source":"proje/Threads.md","expected_sha256":"okumadan-gelen-64-haneli-hash","edits":[{"old":"tek bir kez geçen eski metin","new":"yeni metin"}]}
+```
+
+Her `old` boş olmayan metin olmalı ve uygulandığı anda tam bir kez geçmelidir;
+birden çok düzenleme sırayla uygulanır. Mevcut dosyada tam `content` verilmez.
+Yeni dosyada `expected_sha256: null` ve `content` kullan, `edits` verme.
+`secret-filter` açıksa sır içeren sonuç yazımdan ve yedekten önce reddedilir;
+metin sessizce değiştirilmez. Önceden yazılmış sırrı silen düzenleme kabul edilir.
+`--file -` (varsayılan) JSON'u stdin'den okur. Çıktı her zaman JSON'dur:
+`written` veya `unchanged` çıkış 0, `conflict` çıkış 2, `error` çıkış 1.
+Eksik kaynak argümanı, eksik `--file` değeri ve bilinmeyen seçenek gibi komut
+kullanım hataları `usage_error` ve çıkış 64 verir; `note-read` / `note-edit`
+için bunlar da stdout'ta JSON'dur. Hata nesnesi UTF-8 yazılır; Türkçe karakterler
+`\u` kaçışı yerine olduğu gibi görünür. `--help` olağan yardım metnini gösterir.
+Çakışmada yeniden oku ve diğer ajanın metnini koruyarak hedefli düzenlemeyi yeniden
+kur. Sadece hash'i yenileyip eski metni yeniden yazma; doğrudan dosya yazımıyla
+korumayı atlama. Atomik değiştirme tamamlandıktan sonraki dosya denetimi, dizin
+fsync, sync veya veritabanı hatası `conflict` / çıkış 2 ve `write_occurred: true`
+verir. Bu sonuç ayrıca kanonik `source`, yazılan baytların `written_sha256` özeti,
+varsa `backup` yolu ve `cause` hata türünü taşır. Yazım gerçekleşmiştir; başka
+bir editör sonradan değiştirmiş olabileceğinden bu hash güncel içerik garantisi
+değildir. Önce `note-read` ile yeniden oku ve `sync` çalıştır; aynı düzenlemeyi
+körü körüne tekrarlama. Bu durumda başarı bildirimi ve oturum işaretleyicisi
+üretilmez.
+
+Yönetilen görünümler insan notu olarak okunmaz veya düzenlenmez. Dosyanın
+`generated` / `kind` başlıkları dışarıdan silinse bile güncel `receipt_views`
+kaydı varsa komut yazımdan önce reddedilir; kanonik dosya yolu denetlenir.
+Yalnız dosya adı veya emekliye ayrılmış görünümün geçmişi ret nedeni değildir:
+aynı `daily/GÜN.md` yolundaki sıradan insan notları kullanılabilir.
+Sahiplik veritabanı okunamazsa yazım başlamadan hata döner.
+
+Kilit ve önceki baytların base64 JSON yedekleri vault içindeki
+`.serobeyinn-note-write/` altındadır. MSIX uygulamaları AppData'yı sanallaştırabildiği
+için aynı `.serobeyinn-runtime.json` state yolu bile iki istemcide farklı klasöre
+ulaşabilir. Vault içindeki kilit bu ayrışmadan etkilenmez. Üstteki `.gitignore`
+satırını ekle; araç ayrıca bu yerel klasörde `*` içeren bir `.gitignore` oluşturur.
+İstek dosyalarını da burada benzersiz adla tutup iş bitince kendi isteğini sil.
+Yedekler hassas not metni taşıyabilir, eşitleme ve Git dışında kalmalıdır;
+otomatik yedek temizliği yoktur. `writer.lock` kalıcıdır, açık yazarlar varken silme.
+
+OS kilidi en çok 15 saniye bekler ve süreç kapanınca bırakılır. `note-create`
+de varlık denetimi, kaynak yazımı ve indeks geri okumasında aynı kilidi alır;
+farklı state kökleri kullanan istemciler de aynı yeni notu sessizce ezemez.
+Başarısız `note-create` işleminden kalan journal'ın `sync` ile yeniden
+oynatılması da bu kilide dahildir. Kilit başka yazardaysa bu `sync` o journal
+kaydını beklemeden atlar ve korur; kilidi tutan yazarın kendi `sync`'i ya da sonraki
+`sync` onu tamamlar. Bu durum çakışma sayılmaz, hook bağlamı düşmez. Böylece
+veritabanı işlemi açıkken başka yazarın kilidi beklenmez.
+Kilit altında
+hash kontrolü, tekil hedef denetimi, tam bayt yedeği, geçici dosyaya yazım ve atomik
+değiştirme yapılır; değiştirmeden hemen önce ve sonra kaynak yeniden okunur.
+POSIX'te kaynak dosyanın üst dizini değiştirmeden sonra fsync edilir; bu adım
+başarısızsa yazılmış fakat doğrulanamamış sonuç döner. Windows'ta bu stdlib
+API'siyle dizin fsync yapılmaz; platformun rename ve dosya flush davranışı geçerlidir.
+Başarılı yazım ilgili V3 indeksini günceller. Claude Code oturum kimliği varsa
+receipt hatırlatma penceresi açılır; otomatik receipt gönderilmez.
+
+Koruma işbirliğine dayalıdır. Obsidian, companion yazıcıları ve doğrudan dosya
+araçları bu kilidi almaz; öncesi/sonrası denetim bütün dış yarışları önleyemez.
+Aynı notu eşzamanlı bu araçlarla düzenleme. Kilit çok dosyalı işlem veya ayrı
+makinelerdeki git çalışma kopyaları için garanti vermez. `.serobeyinn-note-write/`
+klasörünü bulut senkronundan da hariç tut. Kaynak yolu vault-göreli görünür
+Markdown olmalıdır; yönetilen kaynaklar, yapılandırma, gizli yollar, symlink ve
+junction yolları reddedilir.
+
+## Vault'u başka klasöre ya da hesaba taşımak
+
+Vault içindeki hook dosyaları kurulumun mutlak yollarını taşır (Python, `serobeyinn_v3_hook.py`, `--vault`,
+`--state`). Kurulu bir vault başka bir klasöre ya da başka bir Windows hesabına taşınınca
+(`C:\Users\<eski>\...`) her yaşam döngüsü hook'u genel bir hatayla düşer. `doctor` bunu
+`hook_paths: stale` ve `needs_attention` olarak gösterir; her satır dosyayı, olayı ve eski
+yolu (`hook_script_missing`, `other_vault`, `python_missing`) verir ([#204](https://github.com/BeNKaYS/SeroBeyinn/issues/204)).
+
+Çözüm, kurucuyu bu makinede yeni vault yoluyla yeniden çalıştırmaktır. Eski state klasörünü
+(ya da kopyasını) `--state` ile ver; kurulum kaydı oradadır ve kurucu yolları taşıyan
+yönetilen vault içi dosyaları yeniden üretir. State'teki indeks (`memory.sqlite3`) de kurulduğu vault yoluna
+bağlıdır ve başka bir yoldaki vault'a açılmaz. Vault taşındıysa bu bağı `--rebind-state`
+açıkça yeni yola çeker ([#593](https://github.com/BeNKaYS/SeroBeyinn/issues/593)):
+
+```text
+py -3 scripts/install_v3.py --vault "C:\Users\<yeni>\Beynim" --state "<eski state klasörü ya da kopyası>" --rebind-state
+```
+
+macOS ve Linux'ta aynı komut `python3 scripts/install_v3.py --vault "/yeni/yol/Beynim" --state
+"<eski state klasörü>" --rebind-state` biçimindedir. Eski state yolu vault'taki
+`.serobeyinn-runtime.json` dosyasının `state` alanındadır.
+
+**Genel köprü kurduysan ayrı olarak yenile:** `--rebind-state` genel istemci ayarlarını
+ve bu ayarlardaki eski vault yolunu değiştirmez. Yeni vault klasöründe, köprü kurduğun
+her harness için önceki `bridge --install` komutunu yeniden çalıştır; bütün
+`--project-root`, özel `--event` ve `--context-chars` seçimlerini koru.
+`doctor` çıktısında `hook_paths: ok` olması genel köprünün yeni yolu kullandığını
+kanıtlamaz; bu kontrol yalnız vault içindeki hook'lara bakar.
+[Genel köprüyü taşıma sonrası doğrulama](GLOBAL-BRIDGE.md#vaultun-yeri-değiştiğinde).
+
+Bayrak verilmezse ve indeks başka bir yola bağlıysa kurucu hiçbir dosyayı değiştirmeden durur,
+eski ve yeni yolu gösterip bayrağı önerir. Taşınan vault'ta `serobeyinn.py update` de aynı hatayla
+durur; `doctor` ve `sync` ise `runtime belongs to another vault` hatasına bu adımı anlatan bir
+`hint` ekler. Bayrak verildiğinde kurucu şu kuralları uygular:
+
+- Kayıtlı eski yol artık yoksa ya da aynı klasörün başka bir adıysa (örneğin yalnız harf
+  büyüklüğü değişen ad ya da eski yolda bırakılmış bir bağlantı) bağ yeni yola çekilir.
+- Eski yolda hala bir klasör varsa ve onun `.serobeyinn-runtime.json` dosyası bu state'i gösteriyorsa
+  ya da okunamıyorsa kurucu reddeder: bu taşıma değil kopya olabilir ve iki vault aynı state'i
+  paylaşırdı. Eski klasör artık kullanılmayan bir kalıntıysa onu kenara taşı ya da adını
+  değiştir. İki kopyayı da tutacaksan yenisini state klasörünün bir **kopyasıyla** kur; eski
+  vault kendi state'iyle çalışmaya devam eder.
+- Vault'taki `.serobeyinn-runtime.json`, bu state'in kurulum kaydının yazdığı dosyayla aynı
+  olmalıdır; değilse kurucu reddeder. Başka bir vault'un state'i bu yolla bağlanamaz.
+- Kayıtlı yol bu makinede mutlak bir yol değilse (başka işletim sisteminden gelen state) kurucu
+  reddeder.
+
+Eski yolun yok görünmesi taşımayı tek başına kanıtlamaz: çıkarılmış bir disk ya da o an bağlı
+olmayan bir ağ klasörü de yok görünür. Bayrağı yalnız vault'u gerçekten taşıdıysan ver. Yanlış
+bir bağlamada bile iki vault'un kaydı karışmaz: indeks tek bir yola bağlı kalır ve öbür vault'un
+komutları `runtime belongs to another vault` ile durur.
+
+Kurucu bağı değiştirmeden önce bütün çakışma kontrollerini bitirir, indeksin tam kopyasını
+state klasörüne `memory-before-rebind.sqlite3` adıyla yazar (sonraki kopyalar `.1`, `.2`
+ekiyle, eskisi silinmez) ve bağı tek bir SQLite transaction içinde değiştirir. Kayıtlar, olay
+geçmişi ve `hook_done` kaydı korunur; sonuç `rebound` alanında (`from`, `to`, `backup`) görünür.
+`--plan --rebind-state` aynı kontrolleri yapar, değişecek bağı `rebind` alanında gösterir ve
+hiçbir şey yazmaz. `doctor` ve `sync` sağlıklıysa yedek kopyayı kendin silebilirsin; hassas
+not metni taşıyabileceği için eşitleme ve Git dışında kalmalıdır.
+
+`serobeyinn.py rollback` bu kurulumun dosya değişikliklerini geri alır, indeks bağını geri almaz:
+bağ vault'un bulunduğu yeri gösterir. Geri alınan hook dosyaları yine eski yolu gösterir
+(`doctor`: `hook_paths: stale`); geri dönülen sürümün kurucusunu aynı `--state` ile yeni yolda
+yeniden çalıştır. Bağ zaten bu yolu gösterdiği için bayrak gerekmez.
+
+Eski state yoksa kurucu kayıtsız bulduğu kurulum dosyalarını (`.serobeyinn-runtime.json` gibi)
+`Unmanaged file conflict` ile korur ve durur. Hook dosyaları başka makineden git'le geldiyse
+içlerindeki eski SeroBeyinn girdileri, Windows'un PowerShell `-EncodedCommand` biçiminde olsalar da
+kurulumda SeroBeyinn'in kendi girdisi olarak tanınır ve yenileriyle değiştirilir; yanlarında
+çalışmayan bir kopya kalmaz.
+
+## Nasıl doğrulandı
+
+Windows 11, Git 2.55 (`core.autocrlf=true`), Python 3.13, `main` @ db1f23d. Yerel bir çıplak
+depo ve iki vault; SeroBeyinn her birine ayrı `--state` ile kuruldu.
+
+- Yukarıdaki `.gitignore` ile ikinci makinede kurulumdan sonra `git status` boş kaldı
+  (`AGENTS.md` geçici nottaki gibi `.gitignore`'daydı; `CLAUDE.md` git'teydi ve değişmedi).
+- Yönetilen bir betik başka sürümden gelmiş gibi değiştirilince o makinede yeniden kurulum
+  `Reinstall conflict: managed file changed` hatası verdi.
+- A'nın receipt'i B'de `sync` sonrası veritabanına ve günlük görünüme girdi. B'nin receipt'i
+  A'ya geçti. `daily/v3/<gün>.md` ve `knowledge/v3/outcomes.md` iki makinede bayt bayt aynı çıktı.
+- `receipts/** -text` kaldırılınca: B'deki receipt CRLF'ye döndü, görünümler farklılaştı,
+  aynı receipt'in yeniden gönderilmesi `event id collision` verdi.
+- İki makine aynı anda Last-Session'a kart, Journal'a kayıt ekleyip aynı Threads satırını
+  değiştirdi: `pull --rebase` Last-Session ve Journal'ı iki kaydı da koruyarak birleştirdi,
+  Threads'te çakışmayla durdu.
+- Threads çakışma işaretleriyle dururken: ilk SessionStart dosyayı değişmiş kaynak diye dışarıda
+  bıraktı; `sync`'ten sonraki SessionStart bağlamında işaretler vardı. `sync` `warnings: []`
+  döndü, `doctor` bir şey göstermedi.
+- İki vault aynı `event_id` ile farklı özetli receipt yazdı: ikisi de aynı `receipts/<özet>.md`,
+  `pull --rebase` add/add çakışmasıyla durdu. A'nın dosyası seçilip devam edilince B'de `sync`
+  `conflicts: []` döndü; B'nin `recap` ve `daily/v3` çıktısı B'nin özetini göstermeye devam etti.
+
+## Satır sonu: `core.autocrlf=true` ve receipt'ler
+
+Bu kontrol [#205](https://github.com/BeNKaYS/SeroBeyinn/issues/205) için eklendi.
+Git for Windows varsayılanı `core.autocrlf=true`, `.gitattributes` ile sabitlenmeyen
+receipt dosyalarını CRLF olarak çıkarabilir. Güncel motor yeni özetleri LF ile yazar,
+CRLF/CR/LF farkını aynı receipt kabul eder ve eski kaynak dosyayı yeniden yazmaz.
+3.12.0 ve öncesinin CRLF çıkışını okurken indekste bıraktığı son CR de aynı receipt sayılır.
+Gerçek özet, refs veya links değişiklikleri hala çakışmadır. Eski istemcilerde
+satır sonu farkı `event id collision` hatasına yol açabilir.
+
+`doctor`, Git deposunda `core.autocrlf=true` iken `receipts/` için `-text` veya `eol=lf`
+yoksa `receipt_line_endings.warning` bildirir. Bu bilgi durum değiştirmez ve dosyalara
+dokunmaz. Bayt değişikliklerini ve eski istemci sorunlarını önlemek için vault'un
+`.gitattributes` dosyasına `receipts/** -text` veya `receipts/** eol=lf` ekleyebilirsiniz.
+Kontrol: `git check-attr text eol -- receipts/x.md`.
+
+Satır sonu değişmiş eski kaynaklar için yerel veritabanını silmek gerekmez;
+`python3 serobeyinn.py sync --full` ile karşılaştırmayı yenileyin. Eski görünümün ham hash'i
+receipt'lerden güvenle yeniden üretilemezse dosya korunur. Bu durumda
+[arşivleyerek görünüm kurtarma](RUNTIME.md#receipt-görünümü-çakışması-ve-kurtarma)
+komutunu kullanın; kaynak receipt'leri silmeyin.
+
+Bu tolerans yalnız güncel motorda vardır. `rollback` yerel veritabanını geri almaz ve
+3.12.0 veya öncesi yine bayt karşılaştırması yapar: satır sonu değişmiş eski bir kaynak
+orada yeniden `receipt_divergence` verir, CRLF özet dosyasıyla gönderilmiş bir receipt
+aynı dosyayla yeniden gönderilince `event id collision` alır. Eski sürümde kalacaksanız
+eski çözüm geçerlidir: state klasöründeki `memory.sqlite3` dosyasını yedeğe taşıyın,
+`python3 serobeyinn.py sync` ve ardından `python3 serobeyinn.py sync --recover-views` çalıştırın;
+yeniden gönderimde özeti LF satır sonlarıyla verin.
+
+Presence eşitlemesi varsayılan olarak kapalıdır. Her cihazda `preferences --parallel-sessions on`
+ile açılır. Yerel `<state>/parallel-presence-device.json` dosyası rastgele bir cihaz kimliği
+tutar; iki cihaz aynı kullanıcı ve state yolunu kullansa da diğerinin açık kaydını silmez.
+Bu kimlik dosyasını vault ile eşitleme. `doctor` kimlik veya presence dosyası oluşturmaz.
+
+## Çevrimdışı mutasyon kuyruğu (isteğe bağlı, yalnız bu makine)
+
+`mutation-queue` komutu bu makinenin state klasöründe yerel bir kuyruk tutar. Cihazlar arası
+taşıma, cihaz yetkilendirmesi, onay protokolü ya da otomatik eşitleme yapmaz; bunlar
+[#205](https://github.com/BeNKaYS/SeroBeyinn/issues/205) altında açık tasarım işidir.
+
+**Varsayılan olarak kapalıdır.** Her makinede ayrı açılır:
+
+```
+python3 serobeyinn.py mutation-queue --enable     # kapatmak için --disable; kuyruktaki kayıtlar korunur
+python3 serobeyinn.py mutation-queue              # durum: enabled, bekleyen/çakışan/başarısız sayıları
+```
+
+Anahtar `<state>/mutation-queue-settings.json` dosyasındadır, `.serobeyinn-preferences.json`'a alan
+eklenmez: eski sürümler bilinmeyen tercih alanını reddettiği için rollback güvenli kalır. Bozuk
+bir anahtar dosyası kapalı sayılır ve üzerine yazılmaz. Kuyruk kapalıyken `--enqueue` ve
+`--replay` hata verir ve hiçbir kuyruk, kimlik ya da kilit dosyası açılmaz; `doctor` yalnız
+`mutation_queue: {"enabled": false}` gösterir.
+
+Komutlar:
+
+- `--enqueue --file x.json`: `{"action", "source", "payload", "mutation_id"?}`. Eylemler
+  `note_create`, `note_update`, `task_create`, `task_update`, `receipt`. Yük kuyruğa girmeden
+  doğrulanır (`note_update` için tam SHA-256 `expected_hash`, `task_update` için tam sayı
+  `expected_revision`). İsteğe bağlı `mutation_id` aynı mutasyonun yeniden gönderilmesini
+  tek kayda indirir; aynı kimlik farklı bir mutasyonla gelirse reddedilir. Normal yazımlar gibi
+  state'in vault bağını denetler: başka bir vault'a bağlı state `runtime belongs to another vault`
+  ile reddedilir, bağsız state bu vault'a bağlanır. Kayıt bu bağın özetini taşır (yolu değil);
+  `--replay` başka bir vault'a bağlı kaydı hiçbir şey yazmadan `failed` yapar. Bu alan
+  eklenmeden önce kuyruğa girmiş kayıtlar eskisi gibi state'in kendi vault'una uygulanır.
+- `--list [--status pending|applied|conflict|failed|dismissed]`, `--replay`, `--clear-applied`
+  (uygulanan ve kapatılan kayıtları siler), `--retry <id>` (incelenmiş `conflict`/`failed`
+  kaydı yeniden `pending` yapar), `--dismiss <id>`.
+
+Kuyruk `<state>/mutation-queue.jsonl`, kimlik `<state>/device.json` dosyasındadır. State her
+zaman vault dışında olduğu için ikisi de vault ile eşitlenmez. Kimlik rastgele 32 haneli onaltılık
+bir değerdir (uuid4); kullanıcı adı, makine adı ya da yol içermez, hiçbir vault dosyasına
+yazılmaz ve `doctor` çıktısında gösterilmez. Presence kimliği varsa ilk kullanımda benimsenip
+`device.json`'a sabitlenir. Kuyruk yazımı, replay ve temizlik state içindeki ortak yerel kilidi
+paylaşır; kilit süresi dolarsa bekleyen çağrı yeniden denenebilir bir `writer busy` hatası alır.
+Kuyruk dosyası atomik olarak yeniden yazılır; Windows'ta kısa bir paylaşım ihlali diğer state
+yazımlarındaki gibi kısa süre yeniden denenir. Bozuk kuyruk satırı bildirilir ve dosya olduğu
+gibi bırakılır.
+
+Replay kuralları:
+
+- `note_update` normal not yazıcısını kullanır; kaynağın tam SHA-256'sı tutmazsa orijinal
+  değişmez ve özel olarak oluşturulan benzersiz bir `.sync-conflict-*.md` kopyası açılır
+  (`sync` bunu uyarı olarak gösterir, indekslemez). Verilmeyen metadata korunur
+  (`visibility`, `project` dahil). Açık sır süzgeci hem güncellemeye hem kopyaya uygulanır.
+- `note_create` ve `task_create` aynı içerik zaten diskteyse yeniden yazmaz, uygulanmış sayar.
+  `receipt` aynı `event_id` için motorun kendi idempotens kuralına uyar.
+- `task_update` çakışmasında kopya açılmaz; kayıt `conflict` olarak incelemeye kalır.
+
+Replay sonundaki indeks eşitlemesi tamamlanmazsa uygulanan mutasyonlar `applied` kalır;
+yeniden kuyruğa eklenmez. JSON çıktısındaki `source_sync`, `degraded` / `conflict` durumunda
+en çok 20 uyarı ve 20 çakışma ile toplam sayılarını; istisnada `error` durumu ve hata türünü
+bildirir. İnsan çıktısı da uyarır. Bu tanı kuyruk dosyasına kaydedilmez. `status: succeeded`,
+`applied` / `failed` sayıları ve çıkış kodu kuyruğun uygulama sonucudur; indeksin tamamen
+güncellendiğini göstermez. Sorunu görmek ve indeksi yenilemek için `python3 serobeyinn.py sync`
+çalıştır; bekleyen kayıt yokken `--replay` tekrar eşitleme yapmaz.
+
+**Kesinti ve uzlaştırma.** Her mutasyonun sonucu, sıradakine geçmeden kuyruğa yazılır. Süreç
+bir mutasyonu uyguladıktan sonra ama bu onayı yazmadan ölürse kayıt `pending` kalır. Sonraki
+`--replay` yeniden yazmadan önce hedefin bu mutasyonu zaten taşıyıp taşımadığına bakar:
+
+- `task_update`: revizyon çakışmasında önce `sync` çalışır (motorun yazma günlüğünde yarım kalan
+  kaynak yazımı tamamlanır), sonra görevin revizyonu `expected_revision`'dan büyükse ve istenen
+  her alan aynı değerdeyse kayıt `applied` ve `reconciled: true` olur. Revizyon ikinci kez
+  artmaz.
+- `note_update`: mevcut not bu güncellemenin üreteceği içerikle bayt bayt aynıysa kayıt
+  `applied` ve `reconciled: true` olur; çakışma kopyası açılmaz.
+
+Hedef mutasyonu taşımıyorsa (örneğin başka bir yazıcı görevi farklı bir değerle güncellediyse)
+kayıt `conflict` kalır ve inceleme gerekir. Bu, dağıtık ve tam bir kez çalışan bir işlem
+değildir; aynı değişikliği bağımsız olarak yapan başka bir yazıcı da uygulanmış sayılır.

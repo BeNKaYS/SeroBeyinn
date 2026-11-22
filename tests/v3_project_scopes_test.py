@@ -1,0 +1,919 @@
+"""Opt-in folder project scopes (.serobeyinn-projects.json) for explicit-project gates."""
+from contextlib import redirect_stderr
+import io
+import json
+import os
+import subprocess
+from pathlib import Path
+import sys
+import tempfile
+import unicodedata
+import unittest
+from unittest.mock import patch
+from v3_package_helpers import clean_environ, inherited_env
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'template/.claude/scripts'))
+import serobeyinn_v3 as runtime
+import serobeyinn_v3_jev as advisor
+
+GAME = 'Projeler/Oyun Kanalları'
+ARCHIVE = 'Projeler/Arşiv'
+
+
+class ProjectScopesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.vault = Path(self.tmp.name) / 'vault'
+        self.vault.mkdir()
+        self.store = runtime.MemoryStore(Path(self.tmp.name) / 'state', self.vault)
+        self.env = clean_environ(TYPESAFE_API_KEY='synthetic-test-key')
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def note(self, ident, source, text=None, **fields):
+        path = self.vault / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = text or 'Kaynak notu ' + ident + ' kısa tercih kaydı içerir.'
+        path.write_text(text, encoding='utf-8')
+        return self.store.ingest(dict(id=ident, source=source, text=text,
+                                      updated_at='2026-09-28T00:00:00Z', **fields))
+
+    def scopes(self, data):
+        text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+        (self.vault / runtime.PROJECT_SCOPES_FILE).write_text(text, encoding='utf-8')
+
+    def ids(self, project):
+        records, _ = self.store._eligible('internal', project)
+        return sorted(r['id'] for r in records)
+
+    def vault_notes(self):
+        self.note('game', GAME + '/Plan.md')
+        self.note('archive', ARCHIVE + '/Plan.md')
+        self.note('rules', 'Companion/Kurallar.md')
+        self.note('tagged', 'Inbox/Etiketli.md', project='oyun')
+
+    def test_without_file_explicit_projects_keep_the_exact_field_gate(self):
+        self.vault_notes()
+        self.assertEqual(self.ids('oyun'), ['tagged'])
+        self.assertEqual(self.ids('arsiv'), [])
+        self.assertEqual(self.ids(None), ['archive', 'game', 'rules', 'tagged'])
+
+    def test_folders_assign_untagged_notes_and_isolate_projects(self):
+        self.vault_notes()
+        self.scopes({'folders': {GAME: 'oyun', ARCHIVE: 'arsiv'}})
+        self.assertEqual(self.ids('oyun'), ['game', 'tagged'])
+        self.assertEqual(self.ids('arsiv'), ['archive'])
+        self.assertEqual(self.ids('baska'), [])
+
+    def test_shared_unscoped_adds_only_notes_without_any_project(self):
+        self.vault_notes()
+        self.scopes({'folders': {GAME: 'oyun', ARCHIVE: 'arsiv'}, 'shared_unscoped': True})
+        self.assertEqual(self.ids('oyun'), ['game', 'rules', 'tagged'])
+        self.assertEqual(self.ids('arsiv'), ['archive', 'rules'])
+        # A project unknown to the file still sees the shared notes, never another project.
+        self.assertEqual(self.ids('baska'), ['rules'])
+
+    def test_record_field_wins_over_folder(self):
+        self.note('moved', GAME + '/Eski.md', project='arsiv')
+        self.scopes({'folders': {GAME: 'oyun'}, 'shared_unscoped': True})
+        self.assertEqual(self.ids('oyun'), [])
+        self.assertEqual(self.ids('arsiv'), ['moved'])
+
+    def test_nested_folder_prefers_the_longest_mapping(self):
+        self.note('outer', 'Projeler/Plan.md')
+        self.note('inner', GAME + '/Plan.md')
+        self.scopes({'folders': {'Projeler': 'genel', GAME: 'oyun'}})
+        self.assertEqual(self.ids('genel'), ['outer'])
+        self.assertEqual(self.ids('oyun'), ['inner'])
+
+    def test_folder_match_stops_at_a_path_boundary(self):
+        self.note('sibling', 'Projeler/Oyun Kanalları Eski/Plan.md')
+        self.note('root', 'Oyun.md')
+        # Both mapped folders exist, so only the path boundary keeps them apart.
+        (self.vault / GAME).mkdir(parents=True)
+        (self.vault / 'Oyun').mkdir()
+        self.scopes({'folders': {GAME: 'oyun', 'Oyun': 'kok'}})
+        self.assertEqual(self.ids('oyun'), [])
+        self.assertEqual(self.ids('kok'), [])
+
+    def test_folder_spelling_is_normalized(self):
+        self.note('game', GAME + '/Plan.md')
+        decomposed = unicodedata.normalize('NFD', GAME).replace('/', '\\') + '/'
+        self.scopes({'folders': {decomposed: 'oyun'}})
+        self.assertEqual(self.ids('oyun'), ['game'])
+
+    def test_folder_case_and_decomposed_disk_names_still_claim_their_notes(self):
+        # macOS keeps names as typed (often NFD) and matches case-insensitively; a folder
+        # typed in another case must not leave its notes in the shared scope.
+        client = unicodedata.normalize('NFD', 'Projeler/Paylaşım X')
+        self.note('client', client + '/Teklif.md')
+        self.note('rules', 'Companion/Kurallar.md')
+        self.scopes({'folders': {'projeler/paylaşım x': 'musteri'}, 'shared_unscoped': True})
+        self.assertEqual(self.ids('musteri'), ['client', 'rules'])
+        self.assertEqual(self.ids('oyun'), ['rules'])
+
+    def test_missing_or_renamed_folder_is_skipped_and_warns(self):
+        # A renamed or deleted project folder is skipped with a warning; other
+        # projects in the file remain fully functional and do not crash with ValueError (#317).
+        self.note('archive', 'Projeler/Arşiv 2025/Plan.md')
+        self.note('game', GAME + '/Plan.md')
+        self.scopes({'folders': {ARCHIVE: 'arsiv', GAME: 'oyun'}, 'shared_unscoped': False})
+        # ARCHIVE folder doesn't exist, but 'oyun' folder exists: 'oyun' continues to work!
+        self.assertEqual(self.ids('oyun'), ['game'])
+        # Querying the missing project returns empty folder scope rather than crashing
+        self.assertEqual(self.ids('arsiv'), [])
+        self.scopes({'folders': {GAME: 'oyun', 'projeler/oyun kanalları/': 'oyun'}})
+        self.assertEqual(self.ids('oyun'), ['game'])
+        # A folder assigned to two projects is skipped and closed to both (#419).
+        self.scopes({'folders': {GAME: 'oyun', 'projeler/oyun kanalları': 'arsiv'}})
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.ids('oyun'), [])
+            self.assertEqual(self.ids('arsiv'), [])
+        self.assertIn('assigned twice', err.getvalue())
+
+    def test_no_project_path_ignores_the_file_even_when_invalid(self):
+        self.vault_notes()
+        self.scopes('{broken')
+        self.assertEqual(self.ids(None), ['archive', 'game', 'rules', 'tagged'])
+        self.assertTrue(self.store.retrieve('kaynak notu', limit=10)['records'])
+
+    def test_missing_folder_keeps_stale_index_rows_out_of_shared_scope(self):
+        note = self.note('private-project', ARCHIVE + '/Plan.md')
+        self.note('game', GAME + '/Plan.md')
+        self.scopes({'folders': {ARCHIVE: 'arsiv', GAME: 'oyun'}, 'shared_unscoped': True})
+        (self.vault / ARCHIVE / 'Plan.md').unlink()
+        (self.vault / ARCHIVE).rmdir()
+        # Exercise actual persisted rows with the deleted folder, as --no-sync does.
+        self.assertEqual(self.ids('oyun'), ['game'])
+        import serobeyinn_v3_projects as projects
+        self.assertIn((runtime._scope_key(ARCHIVE), 'arsiv'), projects.read_project_scopes(self.vault)['folders'])
+
+    def test_management_preserves_invalid_or_symlinked_user_configuration(self):
+        import serobeyinn_v3_projects as projects
+        (self.vault / 'Projeler/Alpha').mkdir(parents=True)
+        path = self.vault / runtime.PROJECT_SCOPES_FILE
+        for raw in ('[]', '{"folders": []}', '{"shared_unscoped": "yes"}'):
+            path.write_text(raw, encoding='utf-8')
+            for action in ('add', 'remove', 'prune'):
+                with self.assertRaises(ValueError):
+                    projects.manage(self.vault, action, folder='Projeler/Alpha', project='alpha')
+                self.assertEqual(path.read_text(encoding='utf-8'), raw)
+        path.unlink()
+        outside = self.vault.parent / 'outside-scopes.json'
+        outside.write_text('{"folders": {}}', encoding='utf-8')
+        try:
+            path.symlink_to(outside)
+        except OSError:
+            return
+        with self.assertRaises(ValueError):
+            projects.manage(self.vault, 'add', folder='Projeler/Alpha', project='alpha')
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(outside.read_text(encoding='utf-8'), '{"folders": {}}')
+
+    def test_cli_scope_list_does_not_initialize_runtime(self):
+        state = self.vault.parent / 'uninitialized-runtime'
+        before = sorted(path.relative_to(self.vault).as_posix() for path in self.vault.rglob('*'))
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/serobeyinn_v3.py'), '--vault', str(self.vault),
+                                 '--state', str(state), 'project-scope', 'list'], env=inherited_env(),
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['status'], 'absent')
+        self.assertFalse(state.exists())
+        self.assertEqual(before, sorted(path.relative_to(self.vault).as_posix() for path in self.vault.rglob('*')))
+
+    def test_invalid_files_fail_closed_for_explicit_projects(self):
+        # A malformed file says nothing reliable about any folder: every explicit project stops.
+        self.vault_notes()
+        for bad in ('{broken', '[]', {'folders': [], 'shared_unscoped': False},
+                    {'folders': {GAME: 'oyun'}, 'shared_unscoped': 'yes'}, {'extra': True}):
+            with self.subTest(bad=bad):
+                self.scopes(bad)
+                with self.assertRaises(ValueError):
+                    self.store._eligible('internal', 'oyun')
+
+    def test_invalid_entries_are_skipped_without_widening_any_scope(self):
+        # #419/#496: one bad entry no longer stops every explicit project. It is skipped
+        # with a warning, shared_unscoped stays off, and a folder it may name is closed.
+        self.vault_notes()
+        valid = {GAME: 'oyun', ARCHIVE: 'arsiv'}
+        for extra in ({'../Disari': 'oyun'}, {'/mutlak': 'oyun'}, {'C:/Users': 'oyun'}, {'': 'oyun'},
+                      {'Projeler/./Oyun': 'oyun'}, {'../../Disari/Arşiv': 'diger'},
+                      {'\\\\sunucu\\paylasim': 'diger'}):
+            with self.subTest(extra=extra):
+                self.scopes({'folders': dict(valid, **extra), 'shared_unscoped': True})
+                with redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(self.ids('oyun'), ['game', 'tagged'])
+                    self.assertEqual(self.ids('arsiv'), ['archive'])
+                    self.assertEqual(self.ids('diger'), [])
+                self.assertIn('skipped project scope entry ' + repr(next(iter(extra))), err.getvalue())
+                self.assertIn('shared_unscoped stays off', err.getvalue())
+        # Without a skipped entry the same file shares the unscoped rules note again.
+        self.scopes({'folders': valid, 'shared_unscoped': True})
+        self.assertEqual(self.ids('oyun'), ['game', 'rules', 'tagged'])
+        # An empty or non-string project on a real folder closes that folder to everyone.
+        for bad in ({GAME: ''}, {GAME: 3}, {GAME: 'oyun', GAME + '/': 'arsiv'}):
+            with self.subTest(bad=bad):
+                self.scopes({'folders': dict({ARCHIVE: 'arsiv'}, **bad), 'shared_unscoped': True})
+                with redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.ids('oyun'), ['tagged'])
+                    self.assertEqual(self.ids('arsiv'), ['archive'])
+                    self.assertEqual(self.ids('baska'), [])
+
+    def test_skipped_nested_entry_never_falls_back_to_the_parent_project(self):
+        # The folder a skipped entry may name stays closed even under a valid parent mapping:
+        # otherwise a typo would hand a nested project's notes to its parent's project.
+        self.vault_notes()
+        inside = str(self.vault / GAME)
+        for spelling in ('Projeler/./Oyun Kanalları', inside, inside.replace('/', '\\'),
+                         '../' + self.vault.name + '/' + GAME, unicodedata.normalize('NFD', GAME) + '/../Oyun Kanalları/.'):
+            with self.subTest(spelling=spelling):
+                self.scopes({'folders': {'Projeler': 'genel', spelling: 'oyun'}, 'shared_unscoped': True})
+                with redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.ids('genel'), ['archive'])
+                    self.assertEqual(self.ids('oyun'), ['tagged'])
+        # Control: the valid spelling of the same nested folder still selects it.
+        self.scopes({'folders': {'Projeler': 'genel', GAME: 'oyun'}, 'shared_unscoped': True})
+        self.assertEqual(self.ids('genel'), ['archive', 'rules'])
+        self.assertEqual(self.ids('oyun'), ['game', 'rules', 'tagged'])
+
+    def test_invalid_folder_warning_names_the_entry_in_both_readers(self):
+        # #419: the warning says which entry was skipped; both copies of the reader agree.
+        import serobeyinn_v3_projects as projects
+        self.vault_notes()
+        cases = ({'../Disari': 'oyun', GAME: 'oyun', 'Projeler': 'genel', 'Projeler/./Arşiv': 'arsiv'},
+                 {GAME: 'oyun', 'projeler/oyun kanalları/': 'arsiv', ARCHIVE: ''},
+                 {'': 'oyun', '/mutlak': 'x', str(self.vault / ARCHIVE): 'arsiv'})
+        for data in cases:
+            with self.subTest(data=data):
+                self.scopes({'folders': data, 'shared_unscoped': True})
+                with redirect_stderr(io.StringIO()) as runtime_err:
+                    actual = runtime.read_project_scopes(self.vault)
+                with redirect_stderr(io.StringIO()) as helper_err:
+                    helper = projects.read_project_scopes(self.vault)
+                self.assertEqual(runtime_err.getvalue(), helper_err.getvalue())
+                self.assertEqual({k: actual[k] for k in ('folders', 'shared_unscoped', 'blocked')},
+                                 {k: helper[k] for k in ('folders', 'shared_unscoped', 'blocked')})
+                self.assertFalse(actual['shared_unscoped'])
+                self.assertTrue(actual['blocked'])
+        self.scopes({'folders': {'../Disari': 'oyun', GAME: 'oyun'}})
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.ids('oyun'), ['game', 'tagged'])
+        self.assertIn("skipped project scope entry '../Disari' in .serobeyinn-projects.json: "
+                      "project scope folder must be vault-relative", err.getvalue())
+        long_entry = '../' + 'x' * 500
+        self.scopes({'folders': {long_entry: 'oyun', GAME: 'oyun'}})
+        with redirect_stderr(io.StringIO()) as err:
+            self.ids('oyun')
+        self.assertLess(len(err.getvalue()), 400)
+
+    def test_cli_explicit_project_skips_bad_entries_without_widening(self):
+        # Real CLI process with BOM files: one bad entry used to fail every --project call.
+        import serobeyinn_v3_projects as projects
+        self.vault_notes()
+        path = self.vault / runtime.PROJECT_SCOPES_FILE
+        for bad in ({'../escape': 'other'}, {'/absolute': 'other'}, {'Projeler/./Other': 'other'}):
+            with self.subTest(bad=bad):
+                data = {'folders': dict({GAME: 'oyun', ARCHIVE: 'arsiv'}, **bad), 'shared_unscoped': True}
+                original = ('\ufeff' + json.dumps(data, ensure_ascii=False)).encode('utf-8')
+                path.write_bytes(original)
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / 'scripts/serobeyinn_v3.py'), '--vault', str(self.vault),
+                     '--state', str(self.store.state_dir), 'context', 'Kaynak notu',
+                     '--project', 'oyun', '--no-sync'], env=inherited_env(),
+                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assertIn('skipped project scope entry ' + repr(next(iter(bad))), result.stderr)
+                records = json.loads(result.stdout)['records']
+                self.assertTrue(records)
+                # Neither the other project nor the unscoped rules note joins the scope.
+                self.assertTrue({record['id'] for record in records} <= {'game', 'tagged'})
+                self.assertEqual(path.read_bytes(), original)
+                report = projects.check_project_scopes(self.vault)
+                self.assertEqual(report['status'], 'error')
+                self.assertFalse(report['shared_unscoped_effective'])
+
+    def test_hook_opening_with_explicit_project_survives_a_bad_entry(self):
+        # Real hook process: a bad entry used to replace the opening with a sync failure
+        # notice, drop per-turn context and record a hook error for doctor (#419).
+        from serobeyinn_v3_sync import SyncEngine
+        companion = self.vault / '\U0001f52e 850-Companion'
+        companion.mkdir()
+        (companion / 'Core.md').write_text('# Core\nCORE_SCOPE_CANARY kimlik notu.\n', encoding='utf-8')
+        (self.vault / GAME).mkdir(parents=True)
+        (self.vault / GAME / 'Takvim.md').write_text('Oyun yayın takvimi PLAN_SCOPE_CANARY hazırlığı.\n',
+                                                    encoding='utf-8')
+        (self.vault / ARCHIVE).mkdir(parents=True)
+        (self.vault / ARCHIVE / 'Takvim.md').write_text('Arşiv yayın takvimi ARCHIVE_SCOPE_CANARY hazırlığı.\n',
+                                                       encoding='utf-8')
+        self.scopes({'folders': {GAME: 'oyun', ARCHIVE: 'arsiv', '../Disari': 'disari'}, 'shared_unscoped': True})
+        state = Path(self.tmp.name) / 'hook-state'
+        home = Path(self.tmp.name) / 'home'
+        home.mkdir()
+        SyncEngine(self.vault, state).sync()
+        env = inherited_env(HOME=str(home), USERPROFILE=str(home), SEROBEYINN_UPDATES_OFF='1',
+                            SEROBEYINN_V3_NO_SPAWN='1', PYTHONIOENCODING='utf-8')
+        contexts = {}
+        for event, prompt in (('SessionStart', ''), ('UserPromptSubmit', 'oyun yayın takvimi hazırlığı')):
+            payload = {'hook_event_name': event, 'session_id': 'scope-session', 'cwd': str(self.vault),
+                       'project': 'oyun', 'prompt': prompt}
+            result = subprocess.run(
+                [sys.executable, str(ROOT / 'template/.claude/scripts/serobeyinn_v3_hook.py'), '--vault', str(self.vault),
+                 '--state', str(state), '--harness', 'codex'], input=json.dumps(payload), env=env,
+                capture_output=True, text=True, encoding='utf-8', timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            contexts[event] = json.loads(result.stdout).get('hookSpecificOutput', {}).get('additionalContext', '')
+            self.assertNotIn('source sync failed', contexts[event])
+        self.assertIn('CORE_SCOPE_CANARY', contexts['SessionStart'])
+        self.assertIn('PLAN_SCOPE_CANARY', contexts['UserPromptSubmit'])
+        self.assertNotIn('ARCHIVE_SCOPE_CANARY', contexts['UserPromptSubmit'])
+        self.assertFalse((state / 'hook-error.json').exists())
+
+    def test_skipped_entries_keep_project_resolution_and_sibling_repositories(self):
+        # #496: a sibling repository resolves through its project or mapped folder name,
+        # never through a '..' path, and one bad entry no longer drops every mapping.
+        import serobeyinn_v3_projects as projects
+        for folder in ('Musteri/Kod', 'Musteri/Gizli', 'Musteri/Diger'):
+            (self.vault / folder).mkdir(parents=True)
+        sibling = Path(self.tmp.name) / 'alfa-repo' / 'src'
+        sibling.mkdir(parents=True)
+        self.scopes({'folders': {'Musteri/Kod': 'alfa-repo', '../alfa-repo': 'alfa-repo',
+                                 'Musteri': 'genel', 'Musteri/./Gizli': 'gizli'}})
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(projects.resolve_active_project(self.vault, sibling), 'alfa-repo')
+            self.assertEqual(projects.resolve_active_project(self.vault, self.vault / 'Musteri/Kod'), 'alfa-repo')
+            self.assertEqual(projects.resolve_active_project(self.vault, self.vault / 'Musteri/Diger'), 'genel')
+            # The folder named by the skipped entry never takes its parent's project.
+            self.assertIsNone(projects.resolve_active_project(self.vault, self.vault / 'Musteri/Gizli'))
+            self.assertEqual(projects.resolve_project_from_query(self.vault, 'alfa-repo testleri'), 'alfa-repo')
+        self.assertIn("skipped project scope entry '../alfa-repo'", err.getvalue())
+        # An unrelated sibling stays unscoped: '..' is never followed.
+        other = Path(self.tmp.name) / 'baska-repo'
+        other.mkdir()
+        with redirect_stderr(io.StringIO()):
+            self.assertIsNone(projects.resolve_active_project(self.vault, other))
+
+    def test_project_scope_list_and_doctor_name_skipped_entries(self):
+        import importlib.util
+        import serobeyinn_v3_projects as projects
+        (self.vault / 'Projeler/Alpha').mkdir(parents=True)
+        self.scopes({'folders': {'Projeler/Alpha': 'alpha', '../Dışarı': 'disari', 'Projeler/Alpha/': 'beta'},
+                     'shared_unscoped': True})
+        report = projects.manage(self.vault, 'list')
+        self.assertEqual(report['invalid_entries'], ['../Dışarı: project scope folder must be vault-relative'])
+        self.assertEqual(report['duplicate_folders'], ['Projeler/Alpha (assigned to alpha and beta)'])
+        self.assertEqual(report['folders'], {})
+        self.assertEqual(report['blocked_folders'], ['projeler/alpha'])
+        self.assertTrue(report['shared_unscoped'])
+        self.assertFalse(report['shared_unscoped_effective'])
+        spec = importlib.util.spec_from_file_location('serobeyinn_entry_scopes', ROOT / 'scripts' / 'serobeyinn_entry.py')
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        listed = entry.human_result(report, 'project-scope', '3.12.0')
+        self.assertIn('../Dışarı: project scope folder must be vault-relative (atlandi)', listed)
+        self.assertIn('shared_unscoped: kapali (atlanan girdiler duzeltilene kadar)', listed)
+        doctor = entry.human_result({'status': 'needs_attention', 'project_scopes': report}, 'doctor', '3.12.0')
+        line = next(line for line in doctor.splitlines() if line.startswith('Proje kapsamlari'))
+        self.assertNotIn('gecersiz: hata', line)
+        self.assertIn('../Dışarı', line)
+        self.assertIn('Projeler/Alpha (assigned to alpha and beta)', line)
+        self.assertIn('shared_unscoped duzeltilene kadar kapali', line)
+        malformed = entry.human_result({'status': 'needs_attention', 'project_scopes': {
+            'status': 'error', 'error': 'invalid JSON: JSONDecodeError'}}, 'doctor', '3.12.0')
+        self.assertIn('Proje kapsamlari (.serobeyinn-projects.json) gecersiz: invalid JSON: JSONDecodeError', malformed)
+        # Adding a scope still refuses to rewrite a file with a bad entry, and names it.
+        with self.assertRaisesRegex(ValueError, r"'\.\./Dışarı' in \.serobeyinn-projects\.json; fix it or run project-scope prune"):
+            projects.manage(self.vault, 'add', folder='Projeler/Alpha', project='alpha')
+
+    def test_visibility_and_freshness_gates_still_apply_inside_a_scope(self):
+        self.note('secret', GAME + '/Gizli.md', visibility='private')
+        stale = self.note('stale', GAME + '/Eski.md')
+        (self.vault / stale['source']).write_text('changed', encoding='utf-8')
+        self.scopes({'folders': {GAME: 'oyun'}, 'shared_unscoped': True})
+        self.assertEqual(self.ids('oyun'), [])
+
+    def test_answer_check_accepts_shared_evidence_and_rejects_other_projects(self):
+        self.vault_notes()
+        self.scopes({'folders': {GAME: 'oyun', ARCHIVE: 'arsiv'}, 'shared_unscoped': True})
+
+        def cite(record):
+            return dict(record_id=record, source_sha256=next(
+                r['source_sha256'] for r in self.store._eligible('internal', None)[0] if r['id'] == record),
+                quote='kısa tercih kaydı')
+
+        def offline(*args):
+            raise AssertionError('jev is off; no provider call expected')
+        result = advisor.verify_answer(self.store, [
+            dict(text='Oyun planı kısa.', citations=[cite('game')]),
+            dict(text='Kural kısa.', citations=[cite('rules')]),
+            dict(text='Arşiv planı kısa.', citations=[cite('archive')]),
+        ], project='oyun', transport=offline)
+        verified = [c['mechanical_verified'] for c in result['claims']]
+        self.assertEqual(verified, [True, True, False])
+        self.assertEqual(result['claims'][2]['diagnostics'], ['citation_not_current_or_exact'])
+
+    def test_review_evidence_from_another_project_is_rejected(self):
+        self.vault_notes()
+        self.scopes({'folders': {GAME: 'oyun', ARCHIVE: 'arsiv'}, 'shared_unscoped': True})
+        archive = next(r for r in self.store._eligible('internal', None)[0] if r['id'] == 'archive')
+        proposal = dict(status='proposed', project='oyun', claim='Plan kısa.',
+                        evidence=[dict(record_id='archive', source_sha256=archive['source_sha256'],
+                                       quote='kısa tercih kaydı')])
+        with self.assertRaisesRegex(ValueError, 'evidence_not_current_or_exact'):
+            advisor.review_candidate(self.store, proposal, project='oyun')
+
+    def test_rejected_matches_follow_the_same_scope(self):
+        claim = 'Kullanıcı amber diyagramları tercih ediyor.'
+        fields = dict(kind='inference', validity='rejected', rejected_reason='duzeltildi',
+                      rejected_at='2026-09-24')
+        self.note('shared-old', 'Companion/Cikarim.md', claim, **fields)
+        self.note('archive-old', ARCHIVE + '/Cikarim.md', claim, **fields)
+        self.scopes({'folders': {ARCHIVE: 'arsiv'}, 'shared_unscoped': True})
+        found = [m['record_id'] for m in runtime.rejected_matches(self.store, claim, 'oyun')]
+        self.assertEqual(found, ['shared-old'])
+
+    def test_doctor_reports_project_scopes_health(self):
+        import serobeyinn_v3_projects as projects
+        # 1. Absent
+        scopes_file = self.vault / runtime.PROJECT_SCOPES_FILE
+        if scopes_file.exists():
+            scopes_file.unlink()
+        report = projects.check_project_scopes(self.vault)
+        self.assertEqual(report['status'], 'absent')
+
+        # 2. OK (all configured folders exist)
+        (self.vault / 'Projeler/A').mkdir(parents=True, exist_ok=True)
+        (self.vault / 'Projeler/B').mkdir(parents=True, exist_ok=True)
+        self.scopes({'folders': {'Projeler/A': 'a', 'Projeler/B': 'b'}, 'shared_unscoped': True})
+        report = projects.check_project_scopes(self.vault)
+        self.assertEqual(report['status'], 'ok')
+        self.assertEqual(report['missing_folders'], [])
+
+        # 3. Warning (missing folder)
+        import shutil
+        shutil.rmtree(self.vault / 'Projeler/B')
+        report = projects.check_project_scopes(self.vault)
+        self.assertEqual(report['status'], 'warning')
+        self.assertEqual(report['missing_folders'], ['Projeler/B'])
+
+        # 4. Error (duplicate folder assignment)
+        self.scopes({'folders': {'Projeler/A': 'a', 'projeler/a': 'other'}})
+        report = projects.check_project_scopes(self.vault)
+        self.assertEqual(report['status'], 'error')
+        self.assertTrue(report['duplicate_folders'])
+
+    def test_project_scope_cli_manage_actions(self):
+        import serobeyinn_v3_projects as projects
+        (self.vault / 'Projeler/Alpha').mkdir(parents=True, exist_ok=True)
+        (self.vault / 'Projeler/Beta').mkdir(parents=True, exist_ok=True)
+
+        # 1. Add
+        res = projects.manage(self.vault, 'add', folder='Projeler/Alpha', project='alpha', shared_unscoped='on')
+        self.assertEqual(res['status'], 'saved')
+        self.assertEqual(res['folders'], {'Projeler/Alpha': 'alpha'})
+        self.assertTrue(res['shared_unscoped'])
+
+        # Add second folder
+        projects.manage(self.vault, 'add', folder='Projeler/Beta', project='beta')
+
+        # 2. List
+        listed = projects.manage(self.vault, 'list')
+        self.assertEqual(listed['status'], 'ok')
+        self.assertIn('Projeler/Alpha', listed['folders'])
+        self.assertIn('Projeler/Beta', listed['folders'])
+
+        # 3. Prune (remove Beta from disk, prune should remove it from .serobeyinn-projects.json)
+        import shutil
+        shutil.rmtree(self.vault / 'Projeler/Beta')
+        pruned = projects.manage(self.vault, 'prune')
+        self.assertEqual(pruned['status'], 'saved')
+        self.assertEqual(pruned['pruned'], ['Projeler/Beta'])
+        self.assertEqual(pruned['folders'], {'Projeler/Alpha': 'alpha'})
+
+        # 4. Remove
+        removed = projects.manage(self.vault, 'remove', folder='Projeler/Alpha')
+        self.assertEqual(removed['status'], 'saved')
+        self.assertEqual(removed['folders'], {})
+
+    def test_utf8_bom_project_scopes_resilience(self):
+        """Scope files and JSON files starting with UTF-8 BOM are loaded cleanly without JSONDecodeError."""
+        import importlib.util
+        import serobeyinn_v3_projects as projects
+        scopes_file = self.vault / runtime.PROJECT_SCOPES_FILE
+        (self.vault / 'Projeler/Alpha').mkdir(parents=True, exist_ok=True)
+        raw = '\ufeff{\n  "folders": {"Projeler/Alpha": "alpha"},\n  "shared_unscoped": false\n}'
+        scopes_file.write_bytes(raw.encode('utf-8'))
+
+        read = projects.read_project_scopes(self.vault)
+        self.assertEqual(read['folders'], [('projeler/alpha', 'alpha')])
+
+        checked = projects.check_project_scopes(self.vault)
+        self.assertEqual(checked['status'], 'ok')
+        self.assertEqual(checked['folders'], {'Projeler/Alpha': 'alpha'})
+
+        listed = projects.manage(self.vault, 'list')
+        self.assertEqual(listed['status'], 'ok')
+        self.assertEqual(listed['folders'], {'Projeler/Alpha': 'alpha'})
+
+        (self.vault / 'Projeler/Gamma').mkdir(parents=True, exist_ok=True)
+        added = projects.manage(self.vault, 'add', folder='Projeler/Gamma', project='gamma')
+        self.assertEqual(added['status'], 'saved')
+        self.assertIn('Projeler/Gamma', added['folders'])
+
+        spec = importlib.util.spec_from_file_location('serobeyinn_v3_cli', ROOT / 'scripts' / 'serobeyinn_v3.py')
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        json_file = self.vault / 'bom_sample.json'
+        json_file.write_bytes('\ufeff{"hello": "world"}'.encode('utf-8'))
+        self.assertEqual(cli.read_json(str(json_file)), {'hello': 'world'})
+
+    def test_runtime_and_cli_accept_bom_without_weakening_project_gates(self):
+        import serobeyinn_v3_projects as projects
+        self.vault_notes()
+        self.note('private', GAME + '/Private.md', visibility='private')
+        stale = self.note('stale', GAME + '/Stale.md')
+        (self.vault / stale['source']).write_text('Changed after indexing', encoding='utf-8')
+        data = {'folders': {GAME: 'oyun', ARCHIVE: 'arsiv'}, 'shared_unscoped': False}
+        path = self.vault / runtime.PROJECT_SCOPES_FILE
+        for bom in ('', '\ufeff'):
+            with self.subTest(bom=bool(bom)):
+                original = (bom + json.dumps(data, ensure_ascii=False)).encode('utf-8')
+                path.write_bytes(original)
+                self.assertEqual(projects.check_project_scopes(self.vault)['status'], 'ok')
+                helper = projects.read_project_scopes(self.vault)
+                actual = runtime.read_project_scopes(self.vault)
+                self.assertEqual(actual['folders'], helper['folders'])
+                self.assertEqual(actual['shared_unscoped'], helper['shared_unscoped'])
+                self.assertEqual(self.ids('oyun'), ['game', 'tagged'])
+                self.assertEqual(self.ids('arsiv'), ['archive'])
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / 'scripts/serobeyinn_v3.py'), '--vault', str(self.vault),
+                     '--state', str(self.store.state_dir), 'context', 'Kaynak notu',
+                     '--project', 'oyun', '--no-sync'], env=inherited_env(),
+                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, '')
+                records = json.loads(result.stdout)['records']
+                self.assertTrue(records)
+                self.assertTrue({record['id'] for record in records} <= {'game', 'tagged'})
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_bom_malformed_scopes_still_fail_closed_in_runtime_and_cli(self):
+        import serobeyinn_v3_projects as projects
+        self.vault_notes()
+        path = self.vault / runtime.PROJECT_SCOPES_FILE
+        cases = ('{broken', '[]', {'folders': []},
+                 {'folders': {GAME: 'oyun'}, 'shared_unscoped': 'yes'},
+                 {'folders': {GAME: 'oyun'}, 'workspaces': {}})
+        for bad in cases:
+            with self.subTest(bad=bad):
+                original = ('\ufeff' + (bad if isinstance(bad, str) else json.dumps(bad))).encode('utf-8')
+                path.write_bytes(original)
+                self.assertEqual(projects.check_project_scopes(self.vault)['status'], 'error')
+                with self.assertRaises(ValueError):
+                    projects.read_project_scopes(self.vault)
+                with self.assertRaises(ValueError):
+                    self.ids('oyun')
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / 'scripts/serobeyinn_v3.py'), '--vault', str(self.vault),
+                     '--state', str(self.store.state_dir), 'context', 'Kaynak notu',
+                     '--project', 'oyun', '--no-sync'], env=inherited_env(),
+                    capture_output=True, text=True, encoding='utf-8', timeout=30)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(json.loads(result.stderr)['error'], 'ValueError')
+                self.assertNotIn('Traceback', result.stderr)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_prune_recovers_from_invalid_and_outside_folder_paths(self):
+        """Invalid or outside-the-vault folder paths do not deadlock project-scope prune."""
+        import serobeyinn_v3_projects as projects
+        scopes_file = self.vault / runtime.PROJECT_SCOPES_FILE
+        (self.vault / 'Projeler/Alpha').mkdir(parents=True, exist_ok=True)
+        raw = json.dumps({
+            'folders': {
+                'Projeler/Alpha': 'alpha',
+                '../outside': 'bad_scope',
+                '/absolute/path': 'bad_abs'
+            },
+            'shared_unscoped': False
+        }, indent=2)
+        scopes_file.write_text(raw, encoding='utf-8')
+
+        # Any normal manage action (like add) fails on invalid paths
+        with self.assertRaises(ValueError):
+            projects.manage(self.vault, 'add', folder='Projeler/Beta', project='beta')
+
+        # But prune succeeds and removes the invalid folder keys
+        pruned = projects.manage(self.vault, 'prune')
+        self.assertEqual(pruned['status'], 'saved')
+        self.assertIn('../outside', pruned['pruned'])
+        self.assertIn('/absolute/path', pruned['pruned'])
+        self.assertEqual(pruned['folders'], {'Projeler/Alpha': 'alpha'})
+
+        # Now that invalid paths are pruned, subsequent manage actions work
+        (self.vault / 'Projeler/Beta').mkdir(parents=True, exist_ok=True)
+        added = projects.manage(self.vault, 'add', folder='Projeler/Beta', project='beta')
+        self.assertEqual(added['status'], 'saved')
+        self.assertIn('Projeler/Beta', added['folders'])
+
+    def test_resolve_active_project_conventions(self):
+        """resolve_active_project resolves a vault working directory to its project (#288, #403)."""
+        import serobeyinn_v3_projects as projects
+        # Standard conventions: projects/<name>, Projeler/<name>, projeler/<name>
+        (self.vault / 'projects/alpha').mkdir(parents=True, exist_ok=True)
+        self.assertEqual(projects.resolve_active_project(self.vault, self.vault / 'projects/alpha'), 'alpha')
+
+        (self.vault / 'Projeler/Beta/nested').mkdir(parents=True, exist_ok=True)
+        self.assertEqual(projects.resolve_active_project(self.vault, self.vault / 'Projeler/Beta/nested'), 'Beta')
+
+        # Negative controls: vault root itself or outside directories return None
+        self.assertIsNone(projects.resolve_active_project(self.vault, self.vault))
+        outside = Path(self.tmp.name) / 'outside'
+        outside.mkdir(parents=True, exist_ok=True)
+        self.assertIsNone(projects.resolve_active_project(self.vault, outside))
+
+    def test_resolve_active_project_from_scoped_folder_and_companion_loading(self):
+        """Active project resolves from .serobeyinn-projects.json and companion loads its Kurallar.md (#288)."""
+        import serobeyinn_v3_projects as projects
+        import serobeyinn_v3_companion as companion
+        custom_folder = '🏰 300-Projects/serai'
+        (self.vault / custom_folder).mkdir(parents=True, exist_ok=True)
+        self.scopes({'folders': {custom_folder: 'serai'}})
+
+        # CWD inside mapped folder resolves project
+        self.assertEqual(projects.resolve_active_project(self.vault, self.vault / custom_folder), 'serai')
+
+        # Companion context loads rules from this custom mapped project folder
+        comp_dir = self.vault / '🔮 850-Companion'
+        comp_dir.mkdir(parents=True, exist_ok=True)
+        (comp_dir / 'Core.md').write_text('# Core\nKimlik.\n', encoding='utf-8')
+        (comp_dir / 'Kurallar.md').write_text('# Kurallar\n- **kural:** GLOBAL_RULE\n- [kapsam: other] OTHER_RULE\n', encoding='utf-8')
+        (comp_dir / 'Last-Session.md').write_text('# Son oturum\n', encoding='utf-8')
+        (comp_dir / 'Threads.md').write_text('# Threads\n', encoding='utf-8')
+        (self.vault / custom_folder / 'Kurallar.md').write_text('# Serai Kuralları\n- **kural:** SERAI_CUSTOM_RULE\n', encoding='utf-8')
+
+        for f in ('Core.md', 'Kurallar.md', 'Last-Session.md', 'Threads.md'):
+            self.store.ingest({'id': f, 'kind': 'note', 'status': 'active',
+                               'source': f'🔮 850-Companion/{f}', 'text': (comp_dir / f).read_text(encoding='utf-8')})
+        self.store.ingest({'id': 'serai-rules', 'kind': 'note', 'status': 'active',
+                           'source': f'{custom_folder}/Kurallar.md', 'text': (self.vault / custom_folder / 'Kurallar.md').read_text(encoding='utf-8')})
+
+        text = companion.context(self.store, 8000, 'test-session', 'claude', project='serai')
+        self.assertIn('SERAI_CUSTOM_RULE', text)
+        self.assertIn('GLOBAL_RULE', text)
+        self.assertNotIn('OTHER_RULE', text)
+
+    def test_resolve_active_project_template_folder_without_explicit_scopes(self):
+        """Official template folder '🏰 300-Projects' resolves active project and loads Kurallar.md (#467)."""
+        import serobeyinn_v3_projects as projects
+        import serobeyinn_v3_companion as companion
+        # Ensure no project scopes JSON exists
+        scopes_file = self.vault / runtime.PROJECT_SCOPES_FILE
+        if scopes_file.exists():
+            scopes_file.unlink()
+
+        template_folder = self.vault / '🏰 300-Projects/sentinel'
+        template_folder.mkdir(parents=True, exist_ok=True)
+
+        # CWD inside official template folder resolves project name automatically
+        self.assertEqual(projects.resolve_active_project(self.vault, template_folder), 'sentinel')
+
+        # Companion discovers and loads rules from template project folder automatically
+        (template_folder / 'Kurallar.md').write_text('# Sentinel Kuralları\n- **kural:** SENTINEL_TEMPLATE_RULE\n', encoding='utf-8')
+        comp_dir = self.vault / '🔮 850-Companion'
+        comp_dir.mkdir(parents=True, exist_ok=True)
+        (comp_dir / 'Core.md').write_text('# Core\nKimlik.\n', encoding='utf-8')
+        (comp_dir / 'Kurallar.md').write_text('# Kurallar\n- **kural:** GLOBAL_RULE\n', encoding='utf-8')
+        (comp_dir / 'Last-Session.md').write_text('# Son oturum\n', encoding='utf-8')
+        (comp_dir / 'Threads.md').write_text('# Threads\n', encoding='utf-8')
+
+        for f in ('Core.md', 'Kurallar.md', 'Last-Session.md', 'Threads.md'):
+            self.store.ingest({'id': f, 'kind': 'note', 'status': 'active',
+                               'source': f'🔮 850-Companion/{f}', 'text': (comp_dir / f).read_text(encoding='utf-8')})
+        self.store.ingest({'id': 'sentinel-rules', 'kind': 'note', 'status': 'active',
+                           'source': '🏰 300-Projects/sentinel/Kurallar.md',
+                           'text': (template_folder / 'Kurallar.md').read_text(encoding='utf-8')})
+
+        text = companion.context(self.store, 8000, 'test-template-session', 'claude', rules_project='sentinel')
+        self.assertIn('SENTINEL_TEMPLATE_RULE', text)
+        self.assertIn('GLOBAL_RULE', text)
+
+    def test_discovered_projects_resolve_external_cwd_and_query(self):
+        from serobeyinn_v3_projects import resolve_active_project, resolve_project_from_query
+        for parent in ('🏰 300-Projects', '42-projects'):
+            with self.subTest(parent=parent):
+                project = self.vault / parent / 'sentinel'
+                project.mkdir(parents=True)
+                external = Path(self.tmp.name) / 'sentinel'
+                external.mkdir(exist_ok=True)
+                self.assertEqual(resolve_active_project(self.vault, external), 'sentinel')
+                self.assertEqual(resolve_project_from_query(self.vault, 'sentinel projesi'), 'sentinel')
+                project.rmdir()
+
+    def test_resolve_active_project_lowercase_discovered_folder(self):
+        """Official template folder '42-projects' resolves active project and loads Kurallar.md (#467)."""
+        import serobeyinn_v3_projects as projects
+        import serobeyinn_v3_companion as companion
+        # Ensure no project scopes JSON exists
+        scopes_file = self.vault / runtime.PROJECT_SCOPES_FILE
+        if scopes_file.exists():
+            scopes_file.unlink()
+
+        template_folder = self.vault / '42-projects/sentinel'
+        template_folder.mkdir(parents=True, exist_ok=True)
+
+        self.assertIn('42-projects', projects.candidate_project_folders(self.vault))
+
+        # CWD inside official template folder resolves project name automatically
+        self.assertEqual(projects.resolve_active_project(self.vault, template_folder), 'sentinel')
+
+        # Companion discovers and loads rules from template project folder automatically
+        (template_folder / 'Kurallar.md').write_text('# Sentinel Kuralları\n- **kural:** SENTINEL_TEMPLATE_RULE\n', encoding='utf-8')
+        comp_dir = self.vault / '🔮 850-Companion'
+        comp_dir.mkdir(parents=True, exist_ok=True)
+        (comp_dir / 'Core.md').write_text('# Core\nKimlik.\n', encoding='utf-8')
+        (comp_dir / 'Kurallar.md').write_text('# Kurallar\n- **kural:** GLOBAL_RULE\n', encoding='utf-8')
+        (comp_dir / 'Last-Session.md').write_text('# Son oturum\n', encoding='utf-8')
+        (comp_dir / 'Threads.md').write_text('# Threads\n', encoding='utf-8')
+
+        for f in ('Core.md', 'Kurallar.md', 'Last-Session.md', 'Threads.md'):
+            self.store.ingest({'id': f, 'kind': 'note', 'status': 'active',
+                               'source': f'🔮 850-Companion/{f}', 'text': (comp_dir / f).read_text(encoding='utf-8')})
+        self.store.ingest({'id': 'sentinel-rules', 'kind': 'note', 'status': 'active',
+                           'source': '42-projects/sentinel/Kurallar.md',
+                           'text': (template_folder / 'Kurallar.md').read_text(encoding='utf-8')})
+
+        text = companion.context(self.store, 8000, 'test-template-session', 'claude', rules_project='sentinel')
+        self.assertIn('SENTINEL_TEMPLATE_RULE', text)
+        self.assertIn('GLOBAL_RULE', text)
+
+    def test_mapped_rules_preserve_path_spelling_and_visibility(self):
+        import serobeyinn_v3_companion as companion
+        from serobeyinn_v3_sync import SyncEngine
+        folder = self.vault / 'Custom/MiXeD'
+        folder.mkdir(parents=True)
+        self.scopes({'folders': {'CUSTOM/mixed': 'alpha'}})
+        source = folder / 'Kurallar.md'
+        for fields, visible in (({'visibility': 'internal'}, True),
+                                ({'visibility': 'private'}, False),
+                                ({'visibility': 'internal', 'trust': 'untrusted'}, False)):
+            with self.subTest(fields=fields):
+                source.write_text('---\n' + json.dumps(dict(id='alpha-rules', kind='note', **fields)) +
+                                  '\n---\n- **kural:** MAPPED_RULE_SENTINEL\n', encoding='utf-8')
+                SyncEngine(self.vault, self.store.state_dir).sync()
+                text = companion.context(self.store, 10000, 'mapped-rules', 'claude', rules_project='alpha')
+                self.assertEqual('\n[Custom/MiXeD/Kurallar.md]\n' in text, visible)
+                self.assertEqual('MAPPED_RULE_SENTINEL' in text, visible)
+                self.assertLessEqual(len(text), 10000)
+
+
+class TestResolveActiveProject(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.vault = Path(self.tmp.name) / 'vault'
+        self.vault.mkdir()
+
+    def test_resolve_active_project_standard_folder(self):
+        import serobeyinn_v3_projects
+        cwd = self.vault / 'projects' / 'my-project' / 'src'
+        cwd.mkdir(parents=True)
+        self.assertEqual(serobeyinn_v3_projects.resolve_active_project(self.vault, cwd), 'my-project')
+
+    def test_resolve_active_project_json_mapping(self):
+        import serobeyinn_v3_projects
+        (self.vault / '.serobeyinn-projects.json').write_text(json.dumps({
+            "folders": {"custom/path": "mapped-project"}
+        }))
+        (self.vault / 'custom' / 'path').mkdir(parents=True)
+        cwd = self.vault / 'custom' / 'path' / 'inside'
+        cwd.mkdir(parents=True)
+        self.assertEqual(serobeyinn_v3_projects.resolve_active_project(self.vault, cwd), 'mapped-project')
+
+    def test_query_alias_preserves_mapping_and_rejects_ambiguity(self):
+        from serobeyinn_v3_projects import resolve_project_from_query
+        (self.vault / 'projects/client').mkdir(parents=True)
+        (self.vault / '.serobeyinn-projects.json').write_text(json.dumps({'folders': {'projects/client': 'alpha'}}))
+        self.assertEqual(resolve_project_from_query(self.vault, 'client projesi'), 'alpha')
+        (self.vault / 'other/client').mkdir(parents=True)
+        (self.vault / '.serobeyinn-projects.json').write_text(json.dumps({'folders': {'projects/client': 'alpha', 'other/client': 'beta'}}))
+        self.assertIsNone(resolve_project_from_query(self.vault, 'client projesi'))
+        self.assertIsNone(resolve_project_from_query(self.vault, 'alphaş sözcüğü'))
+        self.assertIsNone(resolve_project_from_query(self.vault, 'alpha ve beta'))
+
+    def test_external_project_uses_nearest_known_folder(self):
+        from serobeyinn_v3_projects import resolve_active_project
+        (self.vault / 'teams/alpha').mkdir(parents=True)
+        (self.vault / 'projects/beta').mkdir(parents=True)
+        (self.vault / '.serobeyinn-projects.json').write_text(json.dumps({'folders': {'teams/alpha': 'alpha'}}))
+        outside = Path(self.tmp.name) / 'alpha/beta'
+        outside.mkdir(parents=True)
+        self.assertEqual(resolve_active_project(self.vault, outside), 'beta')
+
+    def test_resolve_active_project_missing_json(self):
+        import serobeyinn_v3_projects
+        cwd = self.vault / 'other' / 'folder'
+        cwd.mkdir(parents=True)
+        self.assertIsNone(serobeyinn_v3_projects.resolve_active_project(self.vault, cwd))
+
+    def test_malformed_json_fallback(self):
+        import serobeyinn_v3_projects
+        (self.vault / '.serobeyinn-projects.json').write_text("{malformed")
+        cwd = self.vault / 'projects' / 'fallback-proj'
+        cwd.mkdir(parents=True)
+        # Should gracefully fallback to standard folders
+        self.assertEqual(serobeyinn_v3_projects.resolve_active_project(self.vault, cwd), 'fallback-proj')
+
+    def test_symlink_loop(self):
+        import serobeyinn_v3_projects
+        # A real cycle: a -> b -> a. A link to its own parent resolves normally and is no loop.
+        loop_dir = self.vault / 'projects' / 'dongu'
+        loop_dir.mkdir(parents=True)
+        try:
+            os.symlink(loop_dir / 'b', loop_dir / 'a')
+            os.symlink(loop_dir / 'a', loop_dir / 'b')
+        except OSError:
+            self.skipTest('symlinks unavailable on this platform')
+        self.assertIsNone(serobeyinn_v3_projects.resolve_active_project(self.vault, loop_dir / 'a'))
+        self.assertIsNone(serobeyinn_v3_projects.resolve_active_project(self.vault, str(loop_dir / 'a' / 'src')))
+
+    def test_ntfs_junction_and_symlinks_resolve_properly(self):
+        import serobeyinn_v3_projects
+        # test that resolved path gets the correct active project
+        (self.vault / '.serobeyinn-projects.json').write_text(json.dumps({
+            "folders": {"custom": "my-project"}
+        }))
+        target = self.vault / 'custom'
+        target.mkdir()
+
+        # create symlink outside
+        symlink_dir = Path(self.tmp.name) / 'symlink'
+        created = False
+        try:
+            os.symlink(target, symlink_dir)
+            created = True
+        except OSError:
+            if os.name == 'nt':
+                try:
+                    import _winapi
+                    _winapi.CreateJunction(str(target), str(symlink_dir))
+                    created = True
+                except (ImportError, AttributeError, OSError):
+                    pass
+        if not created:
+            self.skipTest('symlinks and junctions unavailable on this platform')
+        self.assertEqual(serobeyinn_v3_projects.resolve_active_project(self.vault, symlink_dir), 'my-project')
+
+    def test_deleted_directory_graceful_handling(self):
+        import serobeyinn_v3_projects
+        target = self.vault / 'projects' / 'deleted-proj'
+        target.mkdir(parents=True)
+        cwd = target / 'sub'
+        cwd.mkdir()
+        cwd_path = str(cwd)
+        import shutil
+        shutil.rmtree(str(target))
+        # The cwd still points to a deleted directory, resolving should handle gracefully
+        # Using the string path since the Path object might fail to resolve
+        self.assertIsNone(serobeyinn_v3_projects.resolve_active_project(self.vault, cwd_path))
+
+    def test_resolve_active_project_sibling_directory(self):
+        import serobeyinn_v3_projects
+        # Project exists in vault
+        (self.vault / 'projects' / 'sibling-proj').mkdir(parents=True)
+        # Sibling directory outside vault
+        sibling_dir = Path(self.tmp.name) / 'sibling-proj'
+        sibling_dir.mkdir()
+        sub_dir = sibling_dir / 'tests' / 'unit'
+        sub_dir.mkdir(parents=True)
+
+        self.assertEqual(serobeyinn_v3_projects.resolve_active_project(self.vault, sibling_dir), 'sibling-proj')
+        self.assertEqual(serobeyinn_v3_projects.resolve_active_project(self.vault, sub_dir), 'sibling-proj')
+
+        unrelated = Path(self.tmp.name) / 'unrelated-dir'
+        unrelated.mkdir()
+        self.assertIsNone(serobeyinn_v3_projects.resolve_active_project(self.vault, unrelated))
+
+    def test_resolve_project_from_query(self):
+        import serobeyinn_v3_projects
+        (self.vault / 'projects' / 'alpha-service').mkdir(parents=True)
+        (self.vault / 'projects' / 'beta-service').mkdir(parents=True)
+
+        # Single match with punctuation / suffixes
+        self.assertEqual(serobeyinn_v3_projects.resolve_project_from_query(self.vault, "alpha-service'de test yapalım"), "alpha-service")
+        self.assertEqual(serobeyinn_v3_projects.resolve_project_from_query(self.vault, "ALPHA-SERVICE üzerinde çalışıyoruz."), "alpha-service")
+
+        # Ambiguous: multiple matches
+        self.assertIsNone(serobeyinn_v3_projects.resolve_project_from_query(self.vault, "alpha-service ve beta-service entegrasyonu"))
+
+        # No match or substring not matching boundary
+        self.assertIsNone(serobeyinn_v3_projects.resolve_project_from_query(self.vault, "alpha-services paketi"))
+        self.assertIsNone(serobeyinn_v3_projects.resolve_project_from_query(self.vault, "genel bir soru bu"))
+        self.assertIsNone(serobeyinn_v3_projects.resolve_project_from_query(self.vault, ""))
+
+
+if __name__ == '__main__':
+    unittest.main()

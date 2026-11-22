@@ -1,0 +1,712 @@
+"""Cooperative note writes: real processes, exact bytes and CLI/session contracts."""
+import base64
+import hashlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'template/.claude/scripts'))
+from serobeyinn_v3_sync import SyncEngine
+from serobeyinn_v3_notes import LOCAL_DIRECTORY, NoteConflict, Utf8InputError, locked
+from v3_package_helpers import inherited_env
+
+SPEC = importlib.util.spec_from_file_location('note_cli', ROOT / 'scripts/serobeyinn_v3.py')
+cli = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(cli)
+
+
+class NoteEditTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.vault = Path(self.temp.name) / 'vault'
+        self.vault.mkdir()
+        self.state = Path(self.temp.name) / 'state'
+        self.engine = SyncEngine(self.vault, self.state)
+        self.addCleanup(self.engine.store.close)
+        # Never inherit the real agent's session into tests or child processes.
+        self.environment = patch.dict(os.environ)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        os.environ.pop('CLAUDE_CODE_SESSION_ID', None)
+        os.environ.pop('SEROBEYINN_V3_NO_RECEIPT_REMINDER', None)
+
+    def write(self, source='Threads.md', raw=b'alpha\nbeta\n'):
+        path = self.vault / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        return path
+
+    def request(self, old='alpha', new='ALPHA', source='Threads.md'):
+        return {'source': source, 'expected_sha256': self.engine.note_read(source)['sha256'],
+                'edits': [{'old': old, 'new': new}]}
+
+    def command(self, command, *args, state=None):
+        return [sys.executable, str(ROOT / 'scripts/serobeyinn_v3.py'), '--vault', str(self.vault),
+                '--state', str(state or self.state), command, *args]
+
+    def run_cli(self, command, request=None, *args, cwd=None):
+        return subprocess.run(self.command(command, *args),
+                              input=json.dumps(request) if request is not None else None,
+                              text=True, encoding='utf-8', capture_output=True, timeout=30,
+                              env=os.environ.copy(), cwd=cwd)
+
+    def test_missing_read_and_create_do_not_overwrite(self):
+        missing = {'source': 'project/Journal.md', 'exists': False, 'sha256': None, 'content': None}
+        self.assertEqual(self.engine.note_read(missing['source']), missing)
+        request = {'source': missing['source'], 'expected_sha256': None, 'content': '# Journal\r\n'}
+        result = self.engine.note_edit(request)
+        self.assertEqual(result['status'], 'written')
+        self.assertIsNone(result['backup'])
+        self.assertEqual((self.vault / missing['source']).read_bytes(), b'# Journal\r\n')
+        with self.assertRaises(NoteConflict):
+            self.engine.note_edit(request)
+        self.assertFalse((self.state / 'receipt-reminders').exists())
+
+    def test_bom_crlf_and_backup_are_exact_and_index_is_current(self):
+        original = b'\xef\xbb\xbf# Journal\r\nalpha\r\nbeta\r\n'
+        path = self.write(raw=original)
+        snapshot = self.engine.note_read('Threads.md')
+        self.assertEqual(snapshot['content'].encode('utf-8'), original)
+        self.assertEqual(snapshot['sha256'], hashlib.sha256(original).hexdigest())
+        result = self.engine.note_edit(self.request())
+        self.assertEqual(result['status'], 'written')
+        self.assertEqual(path.read_bytes(), original.replace(b'alpha', b'ALPHA'))
+        backup = json.loads((self.vault / result['backup']).read_text(encoding='utf-8'))
+        self.assertEqual(base64.b64decode(backup['bytes_base64']), original)
+        self.assertEqual(backup['sha256'], snapshot['sha256'])
+        self.assertEqual(backup['source'], 'Threads.md')
+        with self.engine.store._connect() as db:
+            record = json.loads(db.execute('SELECT payload FROM records').fetchone()[0])
+        self.assertEqual(record['source_sha256'], result['sha256'])
+
+    def test_stale_hash_and_unique_anchor_leave_bytes_untouched(self):
+        path = self.write(raw=b'alpha alpha\nbeta\n')
+        request = self.request()
+        for value in (request, dict(request, expected_sha256='0' * 64),
+                      dict(request, edits=[{'old': 'absent', 'new': 'new'}])):
+            with self.subTest(value=value):
+                with self.assertRaises(NoteConflict):
+                    self.engine.note_edit(value)
+        self.assertEqual(path.read_bytes(), b'alpha alpha\nbeta\n')
+        self.assertFalse((self.vault / LOCAL_DIRECTORY / 'backups').exists())
+
+    def test_sequential_edits_and_unchanged_have_no_backup(self):
+        self.write()
+        request = self.request(new='alpha')
+        self.assertEqual(self.engine.note_edit(request)['status'], 'unchanged')
+        self.assertFalse((self.vault / LOCAL_DIRECTORY / 'backups').exists())
+        request['edits'] = [{'old': 'alpha', 'new': 'gamma'}, {'old': 'gamma', 'new': 'delta'}]
+        self.assertEqual(self.engine.note_edit(request)['status'], 'written')
+        self.assertEqual((self.vault / 'Threads.md').read_bytes(), b'delta\nbeta\n')
+
+    def test_overlapping_anchors_are_not_unique(self):
+        path = self.write(raw=b'aaa')
+        with self.assertRaises(NoteConflict):
+            self.engine.note_edit(self.request('aa', 'x'))
+        self.assertEqual(path.read_bytes(), b'aaa')
+
+    def test_invalid_requests_are_errors_without_source_writes(self):
+        path = self.write()
+        good = self.request()
+        cases = [[], {}, {'source': 'Threads.md'}, dict(good, expected_sha256=7),
+                 dict(good, content='replacement'), dict(good, edits=[]),
+                 dict(good, edits=[{}]), dict(good, edits=['bad']),
+                 dict(good, edits=[{'old': '', 'new': 'x'}]),
+                 dict(good, edits=[{'old': 'alpha', 'new': 1}]),
+                 {'source': 'new.md', 'expected_sha256': None, 'edits': []}]
+        for request in cases:
+            with self.subTest(request=request), self.assertRaises(ValueError):
+                self.engine.note_edit(request)
+        self.assertEqual(path.read_bytes(), b'alpha\nbeta\n')
+
+    def test_managed_configuration_hidden_outside_and_device_paths_rejected(self):
+        cases = ['tasks/a.md', 'TASKS/a.md', 'receipts/a.md', 'daily/v3/a.md',
+                 'knowledge/v3/outcomes.md', 'AGENTS.md', 'nested/CLAUDE.md', 'SKILL.md',
+                 'config.md', 'GEMINI.md', 'setup-custom.md', '.hidden/a.md', 'notes/.a.md',
+                 '../outside.md', '/outside.md', 'C:/outside.md', 'notes\\a.md',
+                 'a.md:stream.md', 'notes//a.md', 'notes/../a.md', 'notes./a.md',
+                 'notes /a.md', 'NUL.md', 'notes/COM1/a.md', 'notes/a.txt']
+        for source in cases:
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError):
+                    self.engine.note_read(source)
+                with self.assertRaises(ValueError):
+                    self.engine.note_edit({'source': source, 'expected_sha256': None, 'content': 'x'})
+        self.assertEqual(list(self.vault.iterdir()), [])
+
+    def test_managed_frontmatter_rejected_even_with_bom_crlf_or_new_content(self):
+        headers = ['kind: task', 'kind: receipt', 'kind: receipt-index', 'generated: true',
+                   '{"kind":"task"}', '{"generated":true}']
+        for header in headers:
+            raw = ('\ufeff---\r\n' + header + '\r\n---\r\nalpha').encode('utf-8')
+            path = self.write(raw=raw)
+            with self.subTest(header=header):
+                with self.assertRaises(ValueError):
+                    self.engine.note_read('Threads.md')
+                with self.assertRaises(ValueError):
+                    self.engine.note_edit({'source': 'Threads.md',
+                                          'expected_sha256': hashlib.sha256(raw).hexdigest(),
+                                          'edits': [{'old': 'alpha', 'new': 'changed'}]})
+                with self.assertRaises(ValueError):
+                    self.engine.note_edit({'source': 'new.md', 'expected_sha256': None,
+                                          'content': raw.decode('utf-8')})
+            self.assertEqual(path.read_bytes(), raw)
+        self.assertFalse((self.vault / 'new.md').exists())
+
+    def test_symlink_and_linked_local_storage_rejected(self):
+        target = Path(self.temp.name) / 'outside'
+        target.mkdir()
+        (target / 'note.md').write_bytes(b'alpha')
+        try:
+            (self.vault / 'link').symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest('symlink creation unavailable: ' + str(exc))
+        for source in ('link/note.md', 'link/new.md'):
+            with self.assertRaises(ValueError):
+                self.engine.note_read(source)
+            with self.assertRaises(ValueError):
+                self.engine.note_edit({'source': source, 'expected_sha256': None, 'content': 'x'})
+        safe = self.write()
+        (self.vault / 'alias.md').symlink_to(safe)
+        with self.assertRaises(ValueError):
+            self.engine.note_read('alias.md')
+        (self.vault / LOCAL_DIRECTORY).symlink_to(target, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            self.engine.note_read('new.md')
+        self.assertEqual((target / 'note.md').read_bytes(), b'alpha')
+        self.assertFalse((target / 'new.md').exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junction test')
+    def test_windows_junction_rejected_on_python_311_too(self):
+        # An inside-vault target still has to be rejected as a junction.
+        target = self.vault / 'real'
+        target.mkdir()
+        junction = self.vault / 'junction'
+        done = subprocess.run(['cmd', '/c', 'mklink', '/J', str(junction), str(target)],
+                              capture_output=True, timeout=10)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.addCleanup(lambda: os.rmdir(junction))
+        with self.assertRaises(ValueError):
+            self.engine.note_read('junction/new.md')
+        with self.assertRaises(ValueError):
+            self.engine.note_edit({'source': 'junction/new.md', 'expected_sha256': None, 'content': 'x'})
+
+    def test_linked_lock_or_backups_are_rejected(self):
+        self.write()
+        request = self.request()
+        local = self.vault / LOCAL_DIRECTORY
+        lock = local / 'writer.lock'
+        lock.unlink()
+        outside = Path(self.temp.name) / 'outside.lock'
+        outside.write_bytes(b'\0')
+        try:
+            lock.symlink_to(outside)
+        except OSError as exc:
+            self.skipTest('symlink creation unavailable: ' + str(exc))
+        with self.assertRaises(ValueError):
+            self.engine.note_edit(request)
+        lock.unlink()
+        target = Path(self.temp.name) / 'outside-backups'
+        target.mkdir()
+        (local / 'backups').symlink_to(target, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            self.engine.note_edit(request)
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual((self.vault / 'Threads.md').read_bytes(), b'alpha\nbeta\n')
+
+    def test_revalidate_path_after_lock_wait(self):
+        self.write()
+        import serobeyinn_v3_notes as notes
+        real = notes.source_path
+        calls = []
+        def validate(*args):
+            calls.append(True)
+            if len(calls) == 2:
+                raise ValueError('path changed while waiting')
+            return real(*args)
+        with patch.object(notes, 'source_path', side_effect=validate):
+            with self.assertRaisesRegex(ValueError, 'while waiting'):
+                self.engine.note_read('Threads.md')
+
+    def test_external_write_before_and_after_replace_is_reported(self):
+        import serobeyinn_v3_sync as sync
+        import serobeyinn_v3_notes as notes
+        path = self.write()
+        request = self.request()
+        original = notes.tempfile.mkstemp
+        def change_before(*args, **kwargs):
+            result = original(*args, **kwargs)
+            path.write_bytes(b'external before')
+            return result
+        with patch.object(notes.tempfile, 'mkstemp', side_effect=change_before):
+            with self.assertRaisesRegex(NoteConflict, 'before replace'):
+                self.engine.note_edit(request)
+        self.assertEqual(path.read_bytes(), b'external before')
+        self.assertEqual(list(self.vault.glob('.serobeyinn-note-*.tmp')), [])
+        self.write()
+        original_replace = sync._safe_replace
+        def change_after(src, dst):
+            original_replace(src, dst)
+            path.write_bytes(b'external after')
+        with patch.object(sync, '_safe_replace', side_effect=change_after):
+            with self.assertRaisesRegex(NoteConflict, 'after replace'):
+                self.engine.note_edit(request)
+        self.assertEqual(path.read_bytes(), b'external after')
+
+    def test_cli_sha_only_omits_content_and_preserves_exact_hash(self):
+        raw = 'alpha\r\nçığ\n'.encode('utf-8')
+        self.write(raw=raw)
+        result = self.run_cli('note-read', None, 'Threads.md', '--sha-only')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            'source': 'Threads.md', 'exists': True,
+            'sha256': hashlib.sha256(raw).hexdigest()})
+        default = self.run_cli('note-read', None, 'Threads.md')
+        self.assertEqual(json.loads(default.stdout)['content'], raw.decode('utf-8'))
+
+    def test_cli_sha_only_missing_and_must_exist(self):
+        result = self.run_cli('note-read', None, 'missing.md', '--sha-only')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            'source': 'missing.md', 'exists': False, 'sha256': None})
+        result = self.run_cli('note-read', None, 'missing.md', '--sha-only', '--must-exist')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['status'], 'error')
+
+    def test_cli_sha_only_does_not_bypass_source_validation(self):
+        self.write(raw=b'\xff')
+        for source in ('Threads.md', '../outside.md'):
+            result = self.run_cli('note-read', None, source, '--sha-only')
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(json.loads(result.stdout)['status'], 'error')
+
+    def test_cli_json_file_stdin_and_exit_codes(self):
+        self.write()
+        read = self.run_cli('note-read', None, 'Threads.md')
+        self.assertEqual(read.returncode, 0, read.stderr)
+        self.assertEqual(json.loads(read.stdout)['content'], 'alpha\nbeta\n')
+        request = self.request()
+        file = Path(self.temp.name) / 'request.json'
+        file.write_text(json.dumps(request), encoding='utf-8-sig')
+        done = self.run_cli('note-edit', None, '--file', str(file))
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(json.loads(done.stdout)['status'], 'written')
+        stale = self.run_cli('note-edit', request, '--file', '-')
+        self.assertEqual(stale.returncode, 2, stale.stderr + stale.stdout)
+        self.assertEqual(json.loads(stale.stdout)['status'], 'conflict')
+        error = self.run_cli('note-edit', {'source': '../bad.md'})
+        self.assertEqual(error.returncode, 1)
+        self.assertEqual(json.loads(error.stdout)['status'], 'error')
+
+    def test_installed_entry_ships_helper_and_keeps_json_in_human_mode(self):
+        installed = subprocess.run(
+            [sys.executable, str(ROOT / 'scripts/install_v3.py'), '--vault', str(self.vault),
+             '--state', str(self.state)], capture_output=True, text=True, encoding='utf-8',
+            env=dict(os.environ, SEROBEYINN_V3_NO_SPAWN='1'), timeout=40)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.assertTrue((self.vault / '.claude/scripts/serobeyinn_v3_notes.py').is_file())
+        source = 'proje/Journal.md'
+        request = {'source': source, 'expected_sha256': None, 'content': 'new journal\r\n'}
+        def run(*args, payload=None):
+            return subprocess.run([sys.executable, str(self.vault / 'serobeyinn.py'), *args],
+                                  input=json.dumps(payload) if payload else None,
+                                  capture_output=True, text=True, encoding='utf-8',
+                                  env=os.environ.copy(), timeout=30)
+        result = run('note-edit', '--human', '--file', '-', payload=request)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)['status'], 'written')
+        read = run('note-read', source, '--human')
+        self.assertEqual(read.returncode, 0, read.stderr)
+        self.assertEqual(json.loads(read.stdout)['content'], request['content'])
+        sha = run('note-read', source, '--sha-only', '--human')
+        self.assertEqual(sha.returncode, 0, sha.stderr)
+        expected = json.loads(read.stdout)
+        del expected['content']
+        self.assertEqual(json.loads(sha.stdout), expected)
+        stale = run('note-edit', '--file', '-', payload=request)
+        self.assertEqual(stale.returncode, 2, stale.stdout + stale.stderr)
+        self.assertEqual(json.loads(stale.stdout)['status'], 'conflict')
+
+    def test_local_backup_and_lock_are_git_ignored_in_existing_vault(self):
+        done = subprocess.run(['git', 'init', str(self.vault)], capture_output=True, timeout=10)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.write()
+        result = self.engine.note_edit(self.request())
+        for source in (LOCAL_DIRECTORY + '/writer.lock', result['backup'],
+                       LOCAL_DIRECTORY + '/request.json'):
+            ignored = subprocess.run(['git', '-C', str(self.vault), 'check-ignore', source],
+                                     capture_output=True, timeout=10)
+            self.assertEqual(ignored.returncode, 0, ignored.stderr)
+
+    def test_os_lock_timeout_is_a_conflict_and_process_death_releases_lock(self):
+        code = '''import sys
+from serobeyinn_v3_sync import SyncEngine
+from serobeyinn_v3_notes import locked
+engine = SyncEngine(sys.argv[1], sys.argv[2])
+with locked(engine):
+    print('locked', flush=True)
+    sys.stdin.read()
+'''
+        env = dict(os.environ, PYTHONPATH=str(ROOT / 'template/.claude/scripts'))
+        child = subprocess.Popen([sys.executable, '-c', code, str(self.vault), str(self.state)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, env=env)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), 'locked')
+            with self.assertRaisesRegex(NoteConflict, 'writer busy'):
+                with locked(self.engine, timeout=0.1):
+                    self.fail('OS lock was not held by the child')
+        finally:
+            child.kill()
+            child.communicate(timeout=10)
+        self.assertIsNone(self.engine.note_read('new.md')['sha256'])
+
+    def test_only_successful_write_with_session_calls_marker(self):
+        self.write()
+        args = self.command('note-edit')[2:]
+        def invoke(request):
+            with patch.object(sys, 'stdin', io.StringIO(json.dumps(request))):
+                return cli.main(args, return_result=True)
+        with patch.object(cli, 'mark_session_edit') as mark:
+            self.assertEqual(invoke(self.request())[1], 0)
+            mark.assert_not_called()
+            os.environ['CLAUDE_CODE_SESSION_ID'] = 'synthetic-note-session'
+            self.assertEqual(invoke(self.request('ALPHA', 'ALPHA'))[0]['status'], 'unchanged')
+            mark.assert_not_called()
+            self.assertEqual(invoke(self.request('missing', 'x'))[1], 2)
+            self.assertEqual(invoke({'source': '../bad.md'})[1], 1)
+            mark.assert_not_called()
+            with patch.object(SyncEngine, 'sync', return_value={'status': 'succeeded'}):
+                # No matching index row: the source was written but readback failed.
+                self.assertEqual(invoke(self.request('ALPHA', 'unindexed'))[1], 2)
+            mark.assert_not_called()
+            self.engine.sync()
+            self.assertEqual(invoke(self.request('unindexed', 'merged'))[0]['status'], 'written')
+            mark.assert_called_once()
+            # The CLI resolves the state root; macOS /var and Windows 8.3 temp names differ.
+            self.assertEqual(Path(mark.call_args.args[0]).resolve(), self.state.resolve())
+        # A local vault CLI write keeps the raw session identity.
+        marker = self.run_cli('note-edit', self.request('merged', 'final'), cwd=self.vault)
+        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
+        key = hashlib.sha256(b'synthetic-note-session').hexdigest()
+        self.assertTrue((self.state / 'receipt-reminders' / (key + '.edited')).is_file())
+        # The same successful write from an external project belongs to the bridge namespace.
+        external = self.run_cli('note-edit', self.request('final', 'external'), cwd=ROOT)
+        self.assertEqual(external.returncode, 0, external.stdout + external.stderr)
+        external_id = json.dumps([str(ROOT.resolve()), 'synthetic-note-session'])
+        external_key = hashlib.sha256(external_id.encode()).hexdigest()
+        self.assertTrue((self.state / 'receipt-reminders' / (external_key + '.edited')).is_file())
+
+    def test_two_real_processes_one_wins_other_conflicts_then_merges(self):
+        self.write()
+        requests = [self.request('alpha', 'ALPHA'), self.request('beta', 'BETA')]
+        # Both children have the same snapshot and are started while the OS lock
+        # is held. Different state roots must still share this vault's lock.
+        with locked(self.engine):
+            children = [subprocess.Popen(self.command('note-edit', '--file', '-',
+                                                      state=Path(self.temp.name) / ('state-' + str(i))),
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True, encoding='utf-8',
+                                         env=os.environ.copy()) for i in range(2)]
+            for child, request in zip(children, requests):
+                child.stdin.write(json.dumps(request))
+                child.stdin.close()
+                child.stdin = None
+        outputs = [child.communicate(timeout=30) for child in children]
+        self.assertEqual(sorted(child.returncode for child in children), [0, 2], outputs)
+        loser = next(i for i, child in enumerate(children) if child.returncode == 2)
+        self.assertEqual(json.loads(outputs[loser][0])['status'], 'conflict')
+        request = requests[loser]
+        request['expected_sha256'] = self.engine.note_read('Threads.md')['sha256']
+        self.assertEqual(self.engine.note_edit(request)['status'], 'written')
+        self.assertEqual((self.vault / 'Threads.md').read_bytes(), b'ALPHA\nBETA\n')
+        self.assertEqual(len(list((self.vault / LOCAL_DIRECTORY / 'backups').glob('*.json'))), 2)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX permits unlinking an open lock file')
+    def test_replaced_lock_reopens_and_locks_current_inode(self):
+        import fcntl
+        lock = self.vault / LOCAL_DIRECTORY / 'writer.lock'
+        original = os.fstat
+        calls = []
+        def replace_first(fd):
+            info = original(fd)
+            calls.append(info.st_ino)
+            if len(calls) == 1:
+                lock.unlink()
+                lock.touch()
+            return info
+        with patch('os.fstat', side_effect=replace_first):
+            with locked(self.engine):
+                self.assertGreaterEqual(len(calls), 2)
+                self.assertNotEqual(calls[0], calls[-1])
+                with lock.open('a+b') as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_repeated_stale_inode_respects_deadline(self):
+        from types import SimpleNamespace
+        original = os.fstat
+        def stale(fd):
+            info = original(fd)
+            return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino + 1)
+        with patch('os.fstat', side_effect=stale):
+            with self.assertRaises(NoteConflict):
+                with locked(self.engine, timeout=0.01):
+                    self.fail('stale lock must not enter critical section')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX permits unlinking an open lock file')
+    def test_lock_replaced_by_symlink_is_rejected_on_retry(self):
+        lock = self.vault / LOCAL_DIRECTORY / 'writer.lock'
+        outside = self.vault.parent / 'outside.lock'
+        outside.write_bytes(b'preserve')
+        original = os.fstat
+        calls = []
+        def replace_first(fd):
+            info = original(fd)
+            calls.append(info.st_ino)
+            if len(calls) == 1:
+                lock.unlink()
+                lock.symlink_to(outside)
+            return info
+        with patch('os.fstat', side_effect=replace_first):
+            with self.assertRaises(ValueError):
+                with locked(self.engine):
+                    self.fail('symlink lock must be rejected')
+        self.assertEqual(outside.read_bytes(), b'preserve')
+
+    def test_writer_lock_toctou_staleness_retries_on_inode_mismatch(self):
+        orig_fstat = os.fstat
+        calls = []
+
+        def mock_fstat(fd):
+            real_st = orig_fstat(fd)
+            if not calls:
+                calls.append(True)
+                class MockStat:
+                    st_dev = real_st.st_dev
+                    st_ino = real_st.st_ino + 999999
+                return MockStat()
+            return real_st
+
+        with patch('os.fstat', side_effect=mock_fstat):
+            with locked(self.engine):
+                self.assertTrue((self.vault / LOCAL_DIRECTORY / 'writer.lock').exists())
+        self.assertEqual(len(calls), 1)
+
+    def test_note_read_and_edit_under_index_excluded_directory(self):
+        """note-read and note-edit allow reading and modifying notes in index-excluded directories (#468)."""
+        archive_dir = self.vault / '📦 900-Archive'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        note = archive_dir / 'Arşiv.md'
+        note.write_text('# Arşiv\nEski proje durumu: aktif.\n', encoding='utf-8')
+
+        # Configure 📦 900-Archive as excluded in state/index.json
+        (self.state / 'index.json').write_text(
+            json.dumps({'schema': 1, 'excluded_dirs': ['📦 900-Archive']}),
+            encoding='utf-8'
+        )
+
+        # 1. note-read must succeed and return content and sha256
+        read_res = self.engine.note_read('📦 900-Archive/Arşiv.md')
+        self.assertEqual(read_res['source'], '📦 900-Archive/Arşiv.md')
+        self.assertIn('Eski proje durumu: aktif.', read_res['content'])
+
+        # 2. note-edit must succeed and update the note on disk safely
+        edit_req = {
+            'source': '📦 900-Archive/Arşiv.md',
+            'expected_sha256': read_res['sha256'],
+            'edits': [{'old': 'aktif', 'new': 'bırakıldı'}]
+        }
+        edit_res = self.engine.note_edit(edit_req)
+        self.assertEqual(edit_res['status'], 'written')
+        self.assertIn('bırakıldı', note.read_text(encoding='utf-8'))
+
+        # 3. Sensitive directories (🔐 Kasa) must still be strictly refused
+        kasa_dir = self.vault / '🔐 Kasa'
+        kasa_dir.mkdir(parents=True, exist_ok=True)
+        (kasa_dir / 'Gizli.md').write_text('# Gizli\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'sensitive directory'):
+            self.engine.note_read('🔐 Kasa/Gizli.md')
+        with self.assertRaisesRegex(ValueError, 'sensitive directory'):
+            self.engine.note_edit({'source': '🔐 Kasa/Gizli.md', 'expected_sha256': None, 'content': '# X'})
+
+
+
+    def run_raw(self, *args, data=None):
+        return subprocess.run(self.command(*args), input=data, capture_output=True,
+                              timeout=30, env=inherited_env())
+
+    def test_invalid_utf8_is_rejected_without_changing_source(self):
+        cases = ((b'\xed\xa0\xbd\xed\xb8\x8a\n',
+                  r'CESU-8 encoded U\+1F60A \(surrogate pair U\+D83D U\+DE0A\) at byte 0'),
+                 (b'ok \xed\xa0\x80\n', r'encoded lone surrogate U\+D800 at byte 3'),
+                 (b'\xff\n', r'invalid UTF-8 sequence starting with byte 0xFF at byte 0'))
+        for raw, message in cases:
+            with self.subTest(raw=raw):
+                path = self.vault / 'surrogate.md'
+                path.write_bytes(raw)
+                with self.assertRaisesRegex(Utf8InputError, message):
+                    self.engine.note_read('surrogate.md')
+                request = {'source': 'surrogate.md', 'expected_sha256': hashlib.sha256(raw).hexdigest(),
+                           'edits': [{'old': '\n', 'new': ' appended\n'}]}
+                with self.assertRaisesRegex(Utf8InputError, message):
+                    self.engine.note_edit(request)
+                self.assertEqual(path.read_bytes(), raw)
+                result = self.run_cli('note-read', None, 'surrogate.md')
+                self.assertEqual(result.returncode, 1, result.stderr)
+                output = json.loads(result.stdout)
+                self.assertEqual((output['status'], output['error']), ('error', 'Utf8InputError'))
+                self.assertRegex(output['message'], message)
+                self.assertNotIn('Traceback', result.stderr)
+                # Sync skips the source with the same named reason and never rewrites it.
+                warnings = self.engine.sync()['warnings']
+                self.assertTrue(any(warning.get('source') == 'surrogate.md' and
+                                    re.search(message, warning['reason']) for warning in warnings), warnings)
+                self.assertEqual(path.read_bytes(), raw)
+        self.assertFalse((self.vault / LOCAL_DIRECTORY / 'backups').exists())
+
+    def test_unpaired_surrogate_cannot_create_a_partial_note(self):
+        # Two separate code points, as surrogatepass decodes CESU-8; JSON would join them.
+        split = b'\xed\xa0\xbd\xed\xb8\x80'.decode('utf-8', 'surrogatepass')
+        cases = (('new lone surrogate \ud800', r'content is not valid UTF-8: unpaired surrogate U\+D800 at character 19'),
+                 ('x ' + split, r'surrogate pair U\+D83D U\+DE00 instead of U\+1F600 at character 2'),
+                 ('\ude00\ud83d', r'unpaired surrogate U\+DE00 at character 0'))
+        for content, message in cases:
+            with self.subTest(content=ascii(content)):
+                with self.assertRaisesRegex(Utf8InputError, message):
+                    self.engine.note_edit({'source': 'broken.md', 'expected_sha256': None, 'content': content})
+        # Rejected before the note lock: not even the local lock folder is created.
+        self.assertEqual(list(self.vault.iterdir()), [])
+
+    def test_surrogate_edits_leave_source_and_backups_untouched(self):
+        path = self.write()
+        request = self.request()
+        cases = (({'old': 'alpha', 'new': 'x\ud800'}, r'edits\[1\]\.new is not valid UTF-8: unpaired surrogate U\+D800'),
+                 ({'old': 'alpha\udcff', 'new': 'x'}, r'edits\[1\]\.old .* \(undecodable input byte 0xFF\)'),
+                 ({'old': 'alpha', 'new': '\udced\udca0\udcbd\udced\udcb8\udc80'},
+                  r'CESU-8 encoded U\+1F600 .* at character 0 \(undecodable input bytes\)'))
+        for edit, message in cases:
+            with self.subTest(edit=ascii(edit)):
+                with self.assertRaisesRegex(Utf8InputError, message):
+                    self.engine.note_edit(dict(request, edits=[{'old': 'beta', 'new': 'BETA'}, edit]))
+                self.assertEqual(path.read_bytes(), b'alpha\nbeta\n')
+        self.assertFalse((self.vault / LOCAL_DIRECTORY / 'backups').exists())
+        # A JSON escape pair is one valid character and is written as standard UTF-8.
+        emoji = json.loads('"\\ud83d\\ude00 Şifre"')
+        result = self.engine.note_edit(dict(request, edits=[{'old': 'alpha', 'new': emoji}]))
+        self.assertEqual(result['status'], 'written')
+        self.assertEqual(path.read_bytes(), '\U0001F600 Şifre\nbeta\n'.encode('utf-8'))
+
+    def test_surrogate_sources_are_rejected_before_any_filesystem_access(self):
+        # A surrogate source would reach the filesystem as a raw CESU-8 byte name on
+        # POSIX or an unpaired UTF-16 name on Windows.
+        sources = ('\ud800.md', 'notes/\udced\udca0\udcbd\udced\udcb8\udc80.md', 'a\udcff.md',
+                   b'notes/\xed\xa0\xbd\xed\xb8\x80.md'.decode('utf-8', 'surrogatepass'))
+        for source in sources:
+            with self.subTest(source=ascii(source)):
+                with self.assertRaisesRegex(Utf8InputError, 'source is not valid UTF-8'):
+                    self.engine.note_read(source)
+                with self.assertRaisesRegex(Utf8InputError, 'source is not valid UTF-8'):
+                    self.engine.note_edit({'source': source, 'expected_sha256': None, 'content': 'x'})
+                with self.assertRaisesRegex(Utf8InputError, 'source is not valid UTF-8'):
+                    self.engine.note_create('notes/' + source.rsplit('/', 1)[-1], 'x')
+        self.assertEqual(list(self.vault.iterdir()), [])
+        self.assertEqual(list(self.state.glob('markdown-journal/*')), [])
+
+    def test_note_create_rejects_surrogate_text_and_metadata_before_journal(self):
+        cases = ((('notes/a.md', 'body \ud800'), r'text is not valid UTF-8: unpaired surrogate U\+D800'),
+                 (('notes/a.md', 'body', {'title': 'T\udced\udca0\udc80'}),
+                  r'metadata\.title .* encoded lone surrogate U\+D800'),
+                 (('notes/a.md', 'body', {'facts': {'k\ud800': 'v'}}), r'metadata\.facts key'),
+                 (('notes/a.md', 'body', {'facts': {'k': ['ok', '\ude00']}}), r'metadata\.facts\.k\[1\]'))
+        for args, message in cases:
+            with self.subTest(args=ascii(args)):
+                with self.assertRaisesRegex(Utf8InputError, message):
+                    self.engine.note_create(*args)
+        self.assertEqual(list(self.vault.iterdir()), [])
+        self.assertEqual(list(self.state.glob('markdown-journal/*')), [])
+        self.assertEqual(self.engine.note_create('notes/a.md', 'Müşteri \U0001F600')['status'], 'succeeded')
+
+    def test_surrogate_evidence_refs_are_rejected_before_the_lock(self):
+        # Integration of #543 with the note evidence contract (#443): refs are paths hashed
+        # into the retry identity, so they get the same named, write-nothing rejection.
+        path = self.write()
+        request = self.request()
+        before = sorted(item.relative_to(self.vault) for item in self.vault.rglob('*'))
+        for refs, message in ((['notes/\udcff.md'], r'evidence_refs\[0\] .* \(undecodable input byte 0xFF\)'),
+                              (['Threads.md', 'n/\ud800.md'], r'evidence_refs\[1\] is not valid UTF-8: unpaired surrogate U\+D800')):
+            with self.subTest(refs=ascii(refs)):
+                with self.assertRaisesRegex(Utf8InputError, message):
+                    self.engine.note_edit(dict(request, evidence_refs=refs))
+                with self.assertRaisesRegex(Utf8InputError, message):
+                    self.engine.note_create('notes/new.md', 'body', evidence_refs=refs)
+                with self.assertRaisesRegex(Utf8InputError, message):
+                    self.engine.note_create('notes/new.md', 'body', {'evidence_refs': refs})
+        self.assertEqual(path.read_bytes(), b'alpha\nbeta\n')
+        # Nothing new in the vault: no lock folder, backup, idempotency record or note.
+        self.assertEqual(sorted(item.relative_to(self.vault) for item in self.vault.rglob('*')), before)
+        self.assertEqual(list(self.state.glob('markdown-journal/*')), [])
+
+    def test_cli_rejects_cesu8_and_surrogates_from_args_stdin_and_files(self):
+        cesu = b'\xed\xa0\xbd\xed\xb8\x80'
+        raw_json = b'{"source": "new.md", "expected_sha256": null, "content": "x ' + cesu + b'"}'
+        request_file = Path(self.temp.name) / 'request.json'
+        request_file.write_bytes(b'\xef\xbb\xbf' + raw_json)
+        lone = json.dumps({'source': 'new.md', 'expected_sha256': None, 'content': 'x \ud800'})
+        escaped_source = json.dumps({'source': '\udced\udca0\udcbd\udced\udcb8\udc80.md',
+                                     'expected_sha256': None, 'content': 'x'})
+        created = json.dumps({'source': 'notes/a.md', 'text': 'body', 'metadata': {'facts': {'k': '\udfff'}}})
+        cesu_message = r'JSON input is not valid UTF-8: CESU-8 encoded U\+1F600 \(surrogate pair U\+D83D U\+DE00\)'
+        cases = ((('note-edit',), raw_json, cesu_message),
+                 (('note-edit', '--file', str(request_file)), None, cesu_message),
+                 (('note-edit',), lone.encode('ascii'), r'content is not valid UTF-8: unpaired surrogate U\+D800'),
+                 (('note-edit',), escaped_source.encode('ascii'),
+                  r'source is not valid UTF-8: CESU-8 encoded U\+1F600 .*\(undecodable input bytes\)'),
+                 (('note-create',), created.encode('ascii'), r'metadata\.facts\.k is not valid UTF-8'),
+                 (('note-create',), b'{"source": "notes/a.md", "text": "x \xed\xb0\x80"}',
+                  r'JSON input is not valid UTF-8: encoded lone surrogate U\+DC00'))
+        for args, data, message in cases:
+            with self.subTest(args=args, data=data):
+                done = self.run_raw(*args, data=data)
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                # Note JSON commands answer on stdout; note-create reports errors on stderr.
+                output = json.loads(done.stdout if args[0] == 'note-edit' else done.stderr)
+                self.assertEqual(output['error'], 'Utf8InputError')
+                self.assertRegex(output['message'], message)
+                self.assertNotIn(b'Traceback', done.stderr)
+        # A source argument: Windows passes UTF-16 with unpaired surrogates as they are,
+        # POSIX passes undecodable bytes as U+DC80..U+DCFF.
+        for source in ('\ud800.md', '\udced\udca0\udcbd\udced\udcb8\udc80.md'):
+            with self.subTest(source=ascii(source)):
+                result, code = cli.main(self.command('note-read', source)[2:], return_result=True)
+                self.assertEqual((code, result['status'], result['error']), (1, 'error', 'Utf8InputError'))
+        if os.name != 'nt':
+            done = self.run_raw('note-read', cesu + b'.md')
+            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+            output = json.loads(done.stdout)
+            self.assertEqual(output['error'], 'Utf8InputError')
+            self.assertRegex(output['message'], r'source is not valid UTF-8: CESU-8 encoded U\+1F600')
+        self.assertEqual(list(self.vault.iterdir()), [])
+        self.assertEqual(list(self.state.glob('markdown-journal/*')), [])
+
+    def test_invalid_timeouts_are_rejected(self):
+        from serobeyinn_v3_notes import locked
+        cases = [float('nan'), float('inf'), float('-inf'), True, -1, -5.0, '15', None]
+        for timeout in cases:
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(ValueError):
+                    with locked(self.engine, timeout=timeout):
+                        pass
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,15 @@
+.DS_Store
+.serobeyinn-note-write/
+
+# Yerel ajan logları, repoya girmez
+tmp-brief/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Yerel release çıktıları GitHub Release varlığı olarak yayınlanır
+release/
+
+# Geçici yerel ajan çalışma çıktıları
+/.agent-work/

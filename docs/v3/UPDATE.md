@@ -1,0 +1,325 @@
+# Kurulum, güncelleme ve geri alma
+
+Vault içindeki `serobeyinn.py` tek giriş noktasıdır. Komutları vault klasöründe çalıştır. Aşağıdaki örneklerde macOS/Linux için `python3` kullanılır; Windows'ta bunun yerine `py -3` yazılır. Python 3.11+ gerekir.
+
+## Git kullanmadan ilk kurulum
+
+[Son kararlı release sayfasından](https://github.com/BeNKaYS/SeroBeyinn/releases/latest) `serobeyinn-v3-X.Y.Z.zip` paketini indirip aç (`X.Y.Z` sayfadaki sürüm numarasıdır). Paket ve minimum gereksinimler sürüm sayfasında belirtilir. GitHub'ın otomatik kaynak arşivi ile ürün paketi farklıdır.
+
+Bir vault klasörü seç veya oluştur. Açılan paketin içinde:
+
+```sh
+python3 scripts/install_v3.py --vault "/tam/yol/Beynim"
+```
+
+Windows örneği:
+
+```powershell
+py -3 scripts/install_v3.py --vault "C:\Notlar\Beynim"
+```
+
+Runtime varsayılan olarak işletim sisteminin yerel uygulama verisi alanına, vault dışında kurulur. İstersen kurulumda `--state "/ayri/yerel/dizin"` verebilirsin; yalnız bu uygulama için ayrılmış bir dizin seç. Kurulu giriş ve başlatıcılar bu seçimi hatırlar. Yeni hesap, Git, pip veya servis kurulmaz.
+
+İlk bağlantı için AI istemcisinde vault'u açıp yeni oturum başlat. Hook tanımları değiştiğinde istemcinin gerekli güven incelemesini tamamla; updater güven kaydı üretmez. `update` sonucu `trust_review_required: true` olduğunda `trust_review_files` hangi hook dosyalarının değiştiğini söyler; insan çıktısı yalnız o istemcilerin adımını gösterir (`.codex/hooks.json` → Codex `/hooks`, `.kiro/hooks/serobeyinn-v3.json` → Kiro Agent Hooks paneli veya CLI `/hooks`, `.agents/hooks.json` → Antigravity klasör güveni, `.claude/settings.local.json` → Claude Code'da yeni oturum).
+
+## Kontrol ve güncelleme
+
+```sh
+python3 serobeyinn.py doctor
+python3 serobeyinn.py update --check
+python3 serobeyinn.py update
+```
+
+`doctor` yerel kayıtları, bekleyen işleri ve sorunları gösterir. Bir metadata raporu gerçek istemci teslimi veya her notun doğru yorumlandığı kanıtı değildir.
+
+Tamamlanmamış bir güncelleme veya geri alma varsa `doctor`, `update --check` ve `update --check --metadata-only` kurtarma gerektiğini bildirir. Önce devam eden bir güncellemenin bitmesini bekle. İşlem kesildiyse `python3 serobeyinn.py recover` çalıştır, ardından `doctor` ile kontrol et. Açık web görünümü işlem sürerken kapanır.
+
+`update --check` resmi stable release'i inceler ve paketi geçici alanda doğrular. Vault ve mevcut runtime dosyalarını değiştirmez. Paket verilmezse ağ erişimi gerekir. `update` aynı doğrulamadan sonra yeni sürümü uygular. Aynı sürüme ikinci güncelleme no-op'tur; sayısal sürüm sırası kullanılır. Eski bir paketi yükleyerek downgrade yapılmaz; geri dönüş için `rollback` kullanılır.
+
+Varsayılan indirme kaynağı `BeNKaYS/SeroBeyinn` deposunun resmi GitHub stable release'idir. Preview, hareket eden geliştirme dalı veya üçüncü taraf paket kaynağı otomatik seçilmez. Stable release ya da beklenen ZIP yoksa bunu hata olarak bildirir; yayın varmış gibi sonuç vermez.
+
+Yerel, önceden indirilmiş ZIP ile ağ gerekmez:
+
+```sh
+python3 serobeyinn.py update --check --package "/indirilen/serobeyinn-v3-X.Y.Z.zip"
+python3 serobeyinn.py update --package "/indirilen/serobeyinn-v3-X.Y.Z.zip"
+```
+
+Yerel paketi yalnız güvendiğin kaynaktan al: checksum bütünlüğü kontrol eder; bağımsız bir imza veya kaynak güveninin yerine geçmez.
+
+## Tıklanabilir başlatıcılar
+
+Kurucu vault'a yalnız ilgili platformun başlatıcısını koyar:
+
+| Platform | Başlatıcı |
+| --- | --- |
+| macOS | `SeroBeyinn Güncelle.command` |
+| Windows | `SeroBeyinn Guncelle.cmd` |
+| Linux | `SeroBeyinn Güncelle.desktop` ve `SeroBeyinn Güncelle.sh` |
+
+Hepsi kurulu `serobeyinn.py update` komutunu çağırır, ayrı güncelleme mantığı içermez. İşletim sistemi dosyanın açılması/çalıştırılması için izin isteyebilir. Özel Python/runtime yolu kurulumda kaydedilir; Python'u sonradan taşıdıysan kurulumu yeniden değerlendirmek gerekir.
+
+## Kesinti veya sorun
+
+```sh
+python3 serobeyinn.py recover
+python3 serobeyinn.py rollback
+```
+
+`recover`, yarım kalan işlemin journal'ını okuyup planlanan işlemi tamamlar. Bir hata mesajı işlemin iptal edildiği anlamına gelmez; bazı sistem dosyaları yazılmış, başarılı sürüm damgası henüz yazılmamış olabilir.
+
+`rollback`, son sistem işleminin yedeğini geri getirir. [Opsiyonel global köprüyü](GLOBAL-BRIDGE.md) kendin eklediysen, köprüyü içermeyen eski bir sürüme (V3.1.0 ve öncesi) `rollback` veya `uninstall` yapmadan önce global ayardaki köprü handler'larını kaldır; olmayan bir scripti global hook'ta bırakmak istemci hatası üretir. Antigravity köprüsünü eklediysen aynısı 3.9.0 ve öncesine dönerken geçerlidir: o sürümlerin köprüsü `--harness antigravity` tanımaz, önce `~/.gemini/config/hooks.json` içindeki `serobeyinn-v3-bridge` anahtarını kaldır. [Pi](PI.md) kullandıysan Pi desteği içermeyen bir sürüme (3.12.0 ve öncesi) dönerken: `rollback` ve `uninstall` `.pi/extensions/serobeyinn-v3.ts` dosyasını kaldırır, kişisel Pi ayarına veya `pi -e ... --serobeyinn-project-root ...` takma adına eklediğin yolu önce kaldır, yoksa Pi `Unknown option: --serobeyinn-project-root` hatasıyla açılmaz. `--harness pi` receipt'leri kaynakta `harness: manual` ve eski sürümlerin yok saydığı `client: pi` alanıyla yazılır; eski sürüm bunları manual receipt olarak okur ve `sync` sağlıklı kalır, yeniden güncelleme Pi atfını korur. Pi için ayrı bir hariç tutma adı yoktur; extension `adapters` grubuyla hariç tutulur, eski sürümler bu adı tanır. İlk V2 geçişinde önceki sürüm ve tanınan eski runner'lar da geri yüklenir. Temiz V3 kurulumunu geri almak `uninstalled` olarak raporlanır; olmayan bir eski sürüm uydurulmaz. Sonradan eklediğin kullanıcı notları silinmez. Bu komut bütün vault geçmişini geri alan bir işlem değildir.
+
+Yönetilen dosyada araya giren kullanıcı değişikliği varsa işlem bunu ezmek yerine conflict ile durur. Desteklenen JSON ayarlarında ilgisiz değişiklikler korunur; çakışan yönetilen bölüm için inceleme gerekir. Kilitli/aktif bir writer varsa tamamlanmasını bekleyip tekrar dene. Kaybolmuş bir işin kilit/sentinel dosyasını gelişigüzel silme.
+
+Yalnız satır sonu farkı değişiklik sayılmaz: `core.autocrlf` ya da bir editör yönetilen dosyayı CRLF'e çevirmişse güncelleme, kaldırma ve rollback durmaz, dosya yeniden yazılırken stok LF biçimine döner. Conflict mesajı sebebi söyler: `content differs` gerçek bir düzenleme, `deleted` silinmiş dosya demektir.
+
+## Tam kaldırma: kalan bileşenleri kontrol et
+
+`python3 serobeyinn.py rollback` ya da kurucunun `--uninstall` seçeneği vault içindeki
+yönetilen dosyaları geri alır. Bilerek **notları, receipt'leri ve vault dışındaki state
+klasörünü silmez**. Ek olarak açılmış isteğe bağlı bileşenleri şu sırayla kapat:
+
+1. Önce `python3 serobeyinn.py doctor` veya `.serobeyinn-runtime.json` üzerinden state
+   klasörünün tam yolunu kaydet; saklamak istediğin verileri yedekle. Vault kaldırılınca
+   bu CLI ve runtime dosyası artık bulunmayabilir.
+2. Her etkin global köprü için, vault içindeki güncel CLI ile örneğin
+   `python3 serobeyinn.py bridge --harness codex --uninstall` çalıştır (etkin her harness adı
+   için tekrarla). Bu adımı vault adaptörünü kaldırmadan önce yap; global ayarda olmayan bir
+   vault betiği kalırsa istemci başlangıçta hata verebilir.
+3. Yakala kuruluysa `python3 serobeyinn.py yakala kaldir` çalıştır. Bu; kısayol, başlangıç
+   entegrasyonu ve Yakala skill'ini kaldırır; kartlar, indirilen dosyalar ve tanı kayıtları
+   yerinde kalır.
+4. Sonra vault kurulumunu `python3 scripts/install_v3.py --vault "<vault>" --uninstall`
+   ile kaldır veya önceki sürüme dönüyorsan `python3 serobeyinn.py rollback` çalıştır.
+5. En son, saklamak istemediğin makine-yerel indeks/geçmiş varsa önceden kaydettiğin
+   state yolunu ve yedeğini doğrula; state klasörünü **ayrı, açık bir karar** olarak
+   sil. Bu işlem geri alınamaz; varsayılan kaldırmanın parçası değildir.
+
+Birden çok harness veya Yakala kurulumu varsa 2. ve 3. adımları her etkin bileşen için tekrarla.
+Köprü ya da Yakala hiç kurulmadıysa o adımı geç. Kaldırmadan önce `serobeyinn.py doctor`, işlem
+sonrasında `git status --short` ile kalan dosyaları incele; kullanıcıya ait ayarları topluca silme.
+
+
+## Bağlı ana sayfalardan eski sürüme dönüş
+
+Seçilmiş bilgileri kopyalayan `homepage-create` sayfaları kaynaklarının güncel izinlerine
+bağlıdır. Bu bağı bilmeyen eski bir okuyucu (3.12.0 dahil), `sync` sırasında kopyayı
+bağımsız not sayabilir. Bu nedenle `rollback`, hedef okuyucu güvenli ana sayfa geri
+dönüş sözleşmesini taşımıyorsa ve vault içinde bağlı sayfa işaretleri bulunuyorsa,
+**sistem dosyalarını değiştirmeden durur**. Yarım kalmış rollback'in yeniden denenmesi
+ve `recover` yolu da denetimi tekrar yapar.
+
+Mevcut sürümde kalın veya türetilmiş kopyaları bilinçli olarak vault dışına aldıktan
+sonra tekrar deneyin. Yalnız bağlama işaretlerini silmek yeterli değildir: kopyalanmış
+hassas değerler kalırsa eski okuyucu bunları sıradan not olarak okuyabilir. Komut
+kullanıcı notlarını silmez, gizlilik metadata'sını değiştirmez veya bağı kendiliğinden
+koparmaz. Okunamayan Markdown varsa güvenlik doğrulanamadığı için işlem durur.
+Bağlı kopyası olmayan vault'larda rollback normal çalışır. Bu koruma desteklenen
+`rollback`/`recover` akışı içindir; runtime dosyalarını elle eski sürümle değiştirmek
+veya eski bir kurucuyla yeniden kurmak güvenli geri dönüş sayılmaz.
+
+## State dizinini taşımak
+
+State dizini vault'un dışında, yerel hesap altındadır ve varsayılan yeri işletim
+sisteminin uygulama verisi alanıdır (Windows'ta `%LOCALAPPDATA%`). Bazı durumlarda bu
+varsayılanı bırakıp state'i başka bir yere almak gerekir:
+
+- İstemci **MSIX paketi** olarak kuruluysa Windows `%LOCALAPPDATA%` yolunu paketin
+  kapsayıcısına yönlendirir (`...\Packages\<paket-kimliği>\LocalCache\Local\...`).
+  Paket içinden ve paket dışından çalışan süreçler aynı dizeyi okuyup farklı dizine
+  gidebilir; o zaman hafızanın yarısı bir tarafta, yarısı diğerinde kalır.
+- Kapsayıcı yolu paket kimliğini içerir. Uygulama farklı bir kimlikle yeniden kurulursa
+  ya da kapsayıcı sıfırlanırsa sabitlenmiş yol geçersiz kalır.
+- `%LOCALAPPDATA%` bulut ile eşitlenen bir klasöre yönlendirilmişse state eşitlenmemelidir.
+
+Taşıma desteklenen bir işlemdir: `install_v3.py --state` yeni yolu sabitler. Veritabanı
+**vault kök yoluna** bağlıdır, state yoluna değil; bu yüzden aynı vault için state'i taşımak
+veritabanını geçersizleştirmez. Vault'u taşımak ayrı bir konudur: kurucu eski state ve
+`--rebind-state` ile bağı yeni yola açıkça çeker (taşınan vault'ta `serobeyinn.py update` bu adım
+yapılana kadar durur); ayrıntı için [MULTI-MACHINE](MULTI-MACHINE.md#vaultu-başka-klasöre-ya-da-hesaba-taşımak).
+
+### Adımlar
+
+1. **Ajan oturumlarını kapat.** Çalışan bir worker state'e yazıyor olabilir.
+
+2. **Mevcut yolu oku.** Vault kökündeki `.serobeyinn-runtime.json` dosyasındaki `state`
+   alanı sabitlenmiş yoldur. Bu dosyayı elle değiştirme; kurucu yazar.
+
+3. **Hedefi seç.** Vault'un dışında, yalnız bu uygulamaya ayrılmış, yerel sabit bir
+   diskte ve bulut eşitlemesi olmayan bir dizin. Örnek: `F:\serobeyinn-v3-state`.
+
+4. **Dizini kopyala.** Tüm içerik taşınır: `memory.sqlite3`, `v3-install.json`,
+   `hook-queue/`, `hook-done/`, `markdown-journal/`, tercih ve cache dosyaları.
+   Kopya sonrası dosya hash'lerini karşılaştır.
+
+5. **`update-journal.json` dosyasını kopyalama.** Yarıda kalmış bir güncellemeden
+   kalan journal varsa yeni konuma taşınmamalıdır. `install_v3.py` hedef state'te
+   bekleyen bir journal görürse taze kurulum yapmaz; `recover` çağırıp **eski işlemi
+   sürdürür** ve eski sabitlemeyi hedefler. Sonuç `install_resumed: true` döner ve
+   `.serobeyinn-runtime.json` yeni yolu göstermez. Eski dizinde journal varsa önce orada
+   `serobeyinn.py recover` ile işlemi tamamla, sonra kopyala.
+
+6. **Kurucuyu yeni yolla çalıştır.** Önce planı incele:
+
+   ```powershell
+   py -3 scripts/install_v3.py --vault "C:\Notlar\Beynim" --state "F:\serobeyinn-v3-state" --plan
+   ```
+
+   Plan temizse aynı komutu `--plan` olmadan çalıştır. Kurucu dizini oluşturduktan
+   **sonra** yeniden çözümleyip kanonik yolu sabitler.
+
+7. **İki taraftan doğrula.** `py -3 serobeyinn.py doctor --json` komutunu hem ajan kabuğundan
+   (paket içi) hem de normal bir PowerShell penceresinden (paket dışı) çalıştır; aynı
+   sonucu vermeli. `state_location` alanı `warnings` listesini boş, `sibling_state_roots`
+   listesini de tek girdili (ya da boş) göstermeli. `--json` olmadan çalışan insan okunur
+   çıktıda her uyarı `State konumu (bilgi):` ile başlayan bir satırdır; hiç olmamalı.
+
+8. **Eski dizini ancak bundan sonra sil.** Doğrulama geçene kadar dur.
+
+
+### Bölünmüş state'i tanımak
+
+Bölünme kendini bozuk bir kurulum gibi göstermez: iki dizin de gerçekten vardır ve
+ikisinde de `v3-install.json` bulunur, çünkü biri paket içinden biri paket dışından
+kurulmuştur. Tek başına bakıldığında ikisi de sağlıklı görünür; fark, oturumun hangi
+yarıyı okuduğunun sürecin paket içinde olup olmamasına bağlı olmasıdır.
+
+`doctor` bunu `state_location` altında raporlar:
+
+- `sibling_state_roots`: aynı vault anahtarı için kurulu bulunan bütün state kökleri,
+  dizin kimliğine göre bir kez sayılır. Birden fazlaysa `state_split` uyarısı verilir.
+  Paket içinde düz yazım da kapsayıcıya yönlendirildiği için gerçek bir bölünme en
+  güvenilir biçimde **paket dışından** görünür.
+- `pinned_in_package_container`: sabitlenmiş yol `Packages\...\LocalCache` içinden geçiyor.
+- `pin_resolves_elsewhere`: bu süreç sabitlenmiş dizeyi başka bir dizine çözümlüyor. Alan
+  her platformda doldurulur, uyarı yalnız Windows'ta verilir; macOS ve Linux'ta bir
+  symlink her süreç için aynı yere gider, bölünme doğurmaz.
+- `pinned_state_empty`: sabitlenmiş kökte kurulum bulunamadı.
+- `effective_state_differs`: bu çalışma sabitlenmiş kök yerine başka bir state okuyor
+  (örneğin kaynak CLI farklı bir `--state` ile çağrıldı).
+
+Bunlar bilgi amaçlıdır; `doctor` durumunu yükseltmezler. Bölünme görürsen hangi yarının
+güncel olduğuna karar ver (`memory.sqlite3` tarihleri ve makbuz sayısı yardımcı olur),
+onu yukarıdaki adımlarla taşı; diğerini ancak adım 7 doğrulaması geçtikten sonra sil.
+
+### Yönlendirme öncesi yolla sabitlenmiş eski kurulumlar
+
+3.4.0 ve öncesiyle (#114 düzeltmesinden önce) yapılmış bir MSIX kurulumunda sabitlenmiş
+yol yönlendirme uygulanmadan yazılmış olabilir. Bu kendiliğinden düzelmez. Düzeltmek için
+#114'ü içeren kurucuyu **paket içinden** (ajan kabuğundan) mevcut `--state` değeriyle
+yeniden çalıştır; sabitleme yönlendirilmiş kanonik yola döner. Bu durumda kopyalama
+gerekmez, ama adım 5'teki kural geçerlidir: bekleyen bir `update-journal.json` varsa önce
+`serobeyinn.py recover` çalıştır, sonra adım 6'daki gibi önce `--plan` ile incele.
+
+#### `update` ve `recover` ikisi de `transaction target escapes root` veriyorsa (#139)
+
+Paket içinden bakıldığında state kökü eski yazımında kalıp içindeki dosyalar
+`Packages\<paket>\LocalCache\...` altına çözümlenebilir. Bu, kökün kendisi paket dışında da
+var olduğunda olur. Bu sürümden önceki güncelleyici iki yazımı farklı dizin sayıp işlemi
+durduruyordu; `recover` ve bekleyen journal'ı `recover`'a devreden kurucu da aynı kontrolden
+geçtiği için üçü de takılı kalıyordu. Artık hedef kökün altında adıyla duruyor ve arada kök
+dışına götüren bir link (symlink, junction) yoksa yazılıyor; kök dışına çıkan link hala
+reddedilir.
+
+Takılı bir vault kendi kurulu `recover`'ıyla bu duvarı aşamaz, çünkü kurulu güncelleyici
+eski kontrolü taşır. Düzeltmeyi içeren sürümün paketini indirip aç, sonra **paket içinden**
+(ajan kabuğundan) `.serobeyinn-runtime.json`'daki `state` değeriyle kurucuyu çalıştır:
+
+```powershell
+py -3 scripts/install_v3.py --vault "C:\Notlar\Beynim" --state "<.serobeyinn-runtime.json'daki state>"
+```
+
+İlk çalıştırma bekleyen işlemi tamamlar (`install_resumed: true`). Aynı komutu bir kez daha
+çalıştır; bu sefer yeni sürüm kurulur ve vault düzeltilmiş güncelleyiciyi alır. Sonra
+`serobeyinn.py doctor` ile doğrula. Sabitleme dosyasını elle değiştirme.
+
+## `invalid legacy skill hashes` (#73)
+
+17–19 Eylül 2026 arasında `cad7953` (#35) sonrası `main` üzerinden kurulan
+bazı vault'lar `3.0.2` damgası taşısa da resmi V3.0.2 etiketinden farklı bir
+paket doğrulayıcı kullanır. Bu doğrulayıcı V3.1.0/V3.2.0 manifestindeki yeni
+skill yollarını reddeder; `update --check` de aynı hatayı verir. Resmi V3.0.2
+paketinden yapılan geçiş bu özel durumu temsil etmez.
+
+V3.2.1 için hazırlanan paket biçimi bu eski doğrulayıcıyla uyumludur; stable
+olarak yayımlandıktan sonra normal `update` yeterlidir. Henüz yayımlanmamış
+bir düzeltmenin kurulu olduğunu varsayma. Mevcut V3.2.0'a hemen geçmek için:
+
+1. [Resmi V3.2.0 sayfasından](https://github.com/BeNKaYS/SeroBeyinn/releases/tag/v3.2.0)
+   `serobeyinn-v3-3.2.0.zip` ve yanındaki `.sha256` dosyasını indir. ZIP'i açmadan
+   ve içindeki kodu çalıştırmadan önce SHA-256 değerini karşılaştır. macOS/Linux
+   için `shasum -a 256 serobeyinn-v3-3.2.0.zip`, Windows için
+   `Get-FileHash serobeyinn-v3-3.2.0.zip -Algorithm SHA256` kullan; sonuç resmi
+   `.sha256` dosyasının ilk alanıyla aynı olmalı.
+2. Ajan oturumlarını kapat. ZIP'i vault dışında ayrı bir klasöre aç. Mevcut
+   vault'un `.serobeyinn-runtime.json` dosyasındaki `state` yolunu oku; özel state
+   kullandıysan varsayılan yeni bir state yaratma. Bu dosyayı değiştirme.
+3. Açılan paket klasöründe, gerçek vault ve mevcut state yollarıyla planı incele:
+
+   ```sh
+   python3 scripts/install_v3.py --vault "/tam/yol/Beynim" --state "/mevcut/state" --plan
+   ```
+
+4. Plan başarılıysa aynı komutu `--plan` olmadan çalıştır. Installer paket
+   hashlerini doğrular, mevcut kullanıcı düzenlemelerinde conflict ile durur
+   ve güncelleme journal'ı/yedeği oluşturur. Conflict varsa dosyaları ezme,
+   önce değişikliği incele. `.serobeyinn-version` veya kurulu Python dosyalarını
+   elle değiştirme.
+5. Vault içinde `python3 serobeyinn.py doctor` ile sonucu kontrol et. Hook
+   tanımları değiştiyse Codex `/hooks`, Kiro Agent Hooks paneli veya CLI `/hooks`
+   incelemesini tamamla ve yeni oturum aç.
+   Sonraki güncellemeler yine normal `update` komutunu kullanır; gerekirse
+   `rollback` önceki kurulumu geri getirir.
+
+Windows'ta Python komutları için `py -3` kullan. Bu yol kurulu eski
+paket doğrulayıcısını çağırmak yerine doğrulanmış resmi paketin installer'ını
+kullanır; kullanıcı notları ve mevcut state dizini korunur.
+
+## Neler değişir?
+
+Paket yalnız yönetilen motor dosyaları, kurulu giriş/başlatıcılar, üç çekirdek skill ve istemci bağlantılarını günceller. Aynı adlı özel skill veya değiştirilmiş yönetilen script sessizce ezilmez. İlgisiz kullanıcı ayarları desteklenen birleştirme kurallarıyla korunur. Markdown notlar, Companion metinleri ve eski günlük/bilgi kaynakları paket içeriğiyle değiştirilmez.
+
+V2 geçişinde hash ile tanınan stok writer'lar geri alınabilir, etkisiz girişlerle değiştirilir. Böylece önceden açılmış istemcide kalan eski komut da model derleyicisini yeniden başlatmaz. Özelleştirilmiş runner'lar ve proje dışındaki zamanlayıcılar ayrıca değerlendirilir. [Geçiş rehberi](MIGRATION.md).
+
+## Uygulanan kontroller
+
+Arşiv izin listesi, dosya SHA256, sürüm ve runtime şeması doğrulanır. Paket Python dosyaları derlenir; yeni kod ayrı sentetik vault'ta init, sync, kaynak arama ve receipt testinden geçer. Gerçek vault notları bu test için kullanılmaz. Uygulamada yerel kilit, önceki/yeni dosya içerikleri ve modlarıyla kalıcı journal, yönetilen dosya hash kontrolleri ve sürümden önce runtime veritabanı kontrolü vardır. Sürüm damgası en son yazılır.
+
+Bu kontroller dağıtık cloud kilidi veya bütün harici uygulamalar için atomik transaction değildir. Başka bir editörün görülen değişiklikleri korunur; gerçek istemci davranışı ayrı doğrulanır. [Platform raporu](PLATFORM-TESTS.md).
+
+## Bileşen hariç tutma ve güncellemeler
+
+Kullanıcı gereksinim duymadığı bileşenleri (`skills/<ad>`, `adapters/<ad>`, `launchers`, `agents_block`, `harnesses/antigravity`) kurulumda `--exclude-component` ile veya çalışma zamanında `serobeyinn.py preferences --exclude-component <ad>` ile hariç tutabilir (`--include-component` ile geri açabilir).
+
+- `update` ve `install` sırasında hariç tutulan bileşenlere ait yönetilen ve değiştirilmemiş dosyalar diskten temizlenir ve manifestten düşürülür.
+- Kullanıcı tarafından değiştirilmiş dosyalar asla silinmez, üzerine yazılmaz; korunur ve işlem özetinde bildirilir.
+- Kullanıcı ortak dosyalardaki (`AGENTS.md` veya `.agents/hooks.json`) V3 bölgelerini elle kaldırmışsa çakışma üretilmez.
+- Rollback yapıldığında önceki durum geri yüklenir; `.serobeyinn-exclusions.json` dosyasındaki hariç tutma tercihleri korunur.
+- Hariç tutma dosyası okunamıyorsa işletim sistemi hatası korunur; geçersiz JSON veya UTF-8 hatası dosya adını belirtir. Okuma hataları dosyayı değiştirmez.
+
+## Geliştiriciler için paket üretimi
+
+Repo kökünde:
+
+```sh
+python3 scripts/build_v3_release.py --output "/tmp/serobeyinn-v3-3.14.1.zip" --version 3.14.1
+```
+
+Bu komut yalnız yerel ZIP oluşturur, GitHub'a yayınlamaz. Paket `manifest.json`, izin verilen installer/giriş dosyaları, runtime modülleri ve üç skill'i içerir. Manifest sürüm, schema/runtime schema, minimum Python, dosya hashleri ve tanınan legacy hashlerini taşır. Release yayınlama ve final platform CI ayrı işlemlerdir.
+
+## V3.1 sürüm bildirimleri
+
+V3.0.2 kurulumunu bir kere `python3 serobeyinn.py update` ile güncelle. Yeni bildirim kodu bu ilk geçişten sonra çalışır. Windows'ta `py -3` kullan. Oturum açılışı ağ beklemez; kısa ömürlü worker yalnız resmi GitHub metadata'sını günde en fazla bir kez kontrol eder. İlk kontrolün sonucu sonraki oturum veya `doctor` çağrısında görünür. Aynı sürüm her prompt'ta tekrar gösterilmez. Notlar ve prompt'lar bu kontrol için gönderilmez, model çağrısı veya otomatik kurulum yapılmaz.
+
+`update --check --metadata-only` yalnız sürüm bilgisini okur: ZIP indirmez, paket kodu çalıştırmaz ve vault/runtime/cache yazmaz. Tam `update --check` mevcut paket doğrulamasını ve geçici sentetik kurulumu çalıştırmaya devam eder. Metadata sonucu paketin kurulabilirlik kanıtı değildir. Ağ hatası “güncelsin” anlamına gelmez; doctor son başarılı kontrol tarihini ve durumu gösterir.
+
+`preferences --update-notifications off/on` bildirimleri ve otomatik sürüm ağı erişimini yönetir; hafıza senkronizasyon tercihini değiştirmez. `SEROBEYINN_UPDATES_OFF=1` bu tercihten önce gelir. `update --dismiss X.Y.Z` yalnız o sürümün oturum bildirimini susturur; doctor sürümü göstermeye devam eder. Tercih ve cache vault dışında state dizinindedir; eski preference şemasına alan eklenmediğinden eski sürüme rollback güvenlidir. İnternet erişimi kapalıyken `update --package /yol/paket.zip` kullanılabilir.
+
+Online ZIP indirmesinde GitHub asset SHA-256 ve varsa resmi checksum dosyası, herhangi bir paket kodu çalıştırılmadan önce doğrulanır. Cache kurulacak paketin kaynağı değildir; kurulum yeniden resmi metadata okur. Checksum bağımsız yayımlayıcı imzası değildir. `context --no-sync` sürüm kontrolü, worker veya bildirim kaydı oluşturmaz.
+
+## Bakımcı için yayın
+
+`VERSION` ve `docs/v3/releases/X.Y.Z.md` aynı sürümü tanımlar. `Verified V3 release package` workflow'u ZIP'i bir kez build eder; altı OS/Python kombinasyonu bu aynı ZIP'i temiz kurulum, yayınlanmış gerçek V3.0.2 ve V3.1.0 paketlerinden ve `cad7953` ara kurulumundan geçiş, no-op, rollback ve kesinti/recover ile doğrular. PR çalışmaları yayın yapmaz.
+
+Main üzerinde manuel `workflow_dispatch` ve `publish=true`, testler yeşilse aynı bytes'ı önce draft olarak yükler, sonra stable/latest yayınlar ve yayınlanmış asset'i tekrar indirip doğrular. Var olan release'in üzerine yazılmaz; yeni sürüm numarası gerekir. Opsiyonel global köprü (#41) V3.2.0 ile pakete girdi; kurulum ve güncelleme global ayarları değiştirmez ([GLOBAL-BRIDGE.md](GLOBAL-BRIDGE.md)).
