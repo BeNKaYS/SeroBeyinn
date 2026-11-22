@@ -129,6 +129,52 @@ def _text(value):
     return value if isinstance(value, str) else None
 
 
+_GRAPH_SKIP = {'.git', '.obsidian', '.serobeyinn-state', 'node_modules', 'graft', 'attachments'}
+_WIKI_RE = re.compile(r'\[\[([^\]\n]+)\]\]')
+_MD_LINK_RE = re.compile(r'(?<!!)\[[^\]\n]*\]\(\s*<?([^()<>\s]+)>?\s*(?:"[^"]*")?\s*\)')
+
+
+def _graph(core):
+    """Vault Markdown notları ve aralarındaki bağlantılar; gizli klasörler dışarıda kalır."""
+    vault = Path(getattr(core, 'vault', '.')).resolve()
+    nodes, by_key, edges, files = {}, {}, set(), []
+    for path in sorted(vault.rglob('*.md')):
+        try:
+            rel = path.relative_to(vault).as_posix()
+        except ValueError:
+            continue
+        parts = rel.split('/')
+        if any(part.startswith('.') or part in _GRAPH_SKIP for part in parts[:-1]):
+            continue
+        files.append((rel, path))
+        by_key.setdefault(rel[:-3].casefold() if rel.casefold().endswith('.md') else rel.casefold(), rel)
+        by_key.setdefault(path.stem.casefold(), rel)
+    for rel, path in files:
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        title = next((line[2:].strip() for line in text.splitlines() if line.startswith('# ')), path.stem)
+        parts = rel.split('/')
+        nodes[rel] = {'id': rel, 'baslik': title, 'tur': parts[0] if len(parts) > 1 else 'kök'}
+        folder = rel.rsplit('/', 1)[0] if '/' in rel else ''
+        targets = [match.group(1).split('|')[0].split('#')[0].split('^')[0].strip()
+                   for match in _WIKI_RE.finditer(text)]
+        for match in _MD_LINK_RE.finditer(text):
+            target = urllib.parse.unquote(match.group(1).split('#')[0]).strip()
+            if not target or re.match(r'[A-Za-z][A-Za-z0-9+.-]*:', target):
+                continue
+            target = os.path.normpath(os.path.join(folder, target)).replace('\\', '/')
+            targets.append(target[2:] if target.startswith('./') else target)
+        for target in targets:
+            key = target.casefold()
+            dest = by_key.get(key) or by_key.get(key[:-3] if key.endswith('.md') else key)
+            if dest and dest != rel:
+                edges.add((rel, dest))
+    return {'dugumler': list(nodes.values()),
+            'kenarlar': [{'kaynak': source, 'hedef': target} for source, target in sorted(edges)]}
+
+
 def task_view(record):
     priority = record.get('priority')
     return {
@@ -537,6 +583,7 @@ class Handler(BaseHTTPRequestHandler):
             '/api/kayit': lambda: core.record(query.get('id', [''])[0]),
             '/api/makbuzlar': core.receipts,
             '/api/hafiza': core.memory,
+            '/api/graf': lambda: _graph(core),
             '/api/gozden-gecir': core.review,
         }
         self._route(routes.get(url.path))

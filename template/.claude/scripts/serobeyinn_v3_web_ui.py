@@ -85,6 +85,18 @@ meter { width: 100%; height: 10px; }
 .kilit form { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
 .kapandi { position: fixed; inset: 0; background: rgba(10, 14, 20, .94); display: flex; align-items: center; justify-content: center;
   font-size: 18px; z-index: 20; }
+.graf-kutu { position: relative; background: var(--panel); border: 1px solid var(--cizgi); border-radius: 6px;
+  overflow: hidden; height: 68vh; min-height: 360px; }
+#graf-tuval { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+#graf-tuval:active { cursor: grabbing; }
+.graf-aciklama { margin-top: 10px; }
+.graf-lejant { display: flex; gap: 14px; flex-wrap: wrap; color: var(--soluk); font-size: 12px; }
+.graf-lejant i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+.graf-lejant .n-knowledge { background: #f9d71c; }
+.graf-lejant .n-daily { background: #8ab4f8; }
+.graf-lejant .n-receipts { background: #67df70; }
+.graf-lejant .n-companion { background: #ffb4ab; }
+.graf-lejant .n-diger { background: #8b949e; }
 @media (max-width: 760px) { .kabuk { grid-template-columns: 1fr; } .yan { position: static; height: auto; } .ikili { grid-template-columns: 1fr; } }
 """
 
@@ -424,8 +436,180 @@ APP_JS = r"""
     }
   }
 
+  // --- graf -------------------------------------------------------------
+  const GRAF_RENK = { knowledge: '#f9d71c', daily: '#8ab4f8', receipts: '#67df70', companion: '#ffb4ab', 'kök': '#c9d1d9' };
+  let aktifGraf = null;
+  function grafRenk(tur) { return GRAF_RENK[tur] || '#8b949e'; }
+
+  function grafSimule(veri) {
+    const genislik = Math.max(320, $('graf-tuval').clientWidth);
+    const yukseklik = Math.max(240, $('graf-tuval').clientHeight);
+    const dugumler = veri.dugumler.map(function (n) {
+      const aci = Math.random() * Math.PI * 2;
+      const yaricap = Math.min(genislik, yukseklik) * (0.16 + Math.random() * 0.24);
+      return { veri: n, x: genislik / 2 + Math.cos(aci) * yaricap, y: yukseklik / 2 + Math.sin(aci) * yaricap, vx: 0, vy: 0 };
+    });
+    const indeks = {};
+    dugumler.forEach(function (d) { indeks[d.veri.id] = d; });
+    const kenarlar = veri.kenarlar.map(function (e) { return { a: indeks[e.kaynak], b: indeks[e.hedef] }; })
+      .filter(function (e) { return e.a && e.b; });
+    return { dugumler: dugumler, kenarlar: kenarlar, olcek: 1, panX: 0, panY: 0, secili: null,
+      genislik: genislik, yukseklik: yukseklik, sabit: null, kare: 0 };
+  }
+
+  function grafFizik(durum) {
+    const d = durum.dugumler;
+    for (let i = 0; i < d.length; i += 1) {
+      for (let j = i + 1; j < d.length; j += 1) {
+        let dx = d[j].x - d[i].x, dy = d[j].y - d[i].y;
+        let uzak = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        if (uzak > 900) { continue; }
+        const kuvvet = 4600 / (uzak * uzak);
+        dx /= uzak; dy /= uzak;
+        d[i].vx -= dx * kuvvet; d[i].vy -= dy * kuvvet;
+        d[j].vx += dx * kuvvet; d[j].vy += dy * kuvvet;
+      }
+    }
+    durum.kenarlar.forEach(function (e) {
+      let dx = e.b.x - e.a.x, dy = e.b.y - e.a.y;
+      const uzak = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const kuvvet = (uzak - 165) * 0.014;
+      dx /= uzak; dy /= uzak;
+      e.a.vx += dx * kuvvet; e.a.vy += dy * kuvvet;
+      e.b.vx -= dx * kuvvet; e.b.vy -= dy * kuvvet;
+    });
+    const cx = durum.genislik / 2, cy = durum.yukseklik / 2;
+    d.forEach(function (n) {
+      if (durum.sabit === n) { n.vx = 0; n.vy = 0; return; }
+      n.vx += (cx - n.x) * 0.0012; n.vy += (cy - n.y) * 0.0012;
+      n.vx *= 0.86; n.vy *= 0.86;
+      n.x += n.vx; n.y += n.vy;
+    });
+  }
+
+  function grafCiz(durum, ctx, dpr) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, durum.genislik, durum.yukseklik);
+    ctx.save();
+    ctx.translate(durum.panX, durum.panY);
+    ctx.scale(durum.olcek, durum.olcek);
+    ctx.strokeStyle = 'rgba(139,148,158,.35)';
+    ctx.lineWidth = 1 / durum.olcek;
+    durum.kenarlar.forEach(function (e) {
+      ctx.beginPath(); ctx.moveTo(e.a.x, e.a.y); ctx.lineTo(e.b.x, e.b.y); ctx.stroke();
+    });
+    durum.dugumler.forEach(function (n) {
+      const secili = durum.secili === n.veri.id;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, (secili ? 9 : 6) / durum.olcek, 0, Math.PI * 2);
+      ctx.fillStyle = grafRenk(n.veri.tur);
+      ctx.fill();
+      if (secili) { ctx.lineWidth = 2 / durum.olcek; ctx.strokeStyle = '#dfe2eb'; ctx.stroke(); }
+    });
+    if (durum.olcek > 0.5) {
+      ctx.font = (11 / durum.olcek) + 'px ui-monospace, Menlo, monospace';
+      ctx.fillStyle = '#8b949e';
+      ctx.textAlign = 'center';
+      durum.dugumler.forEach(function (n) {
+        const etiket = n.veri.baslik.length > 22 ? n.veri.baslik.slice(0, 21) + '…' : n.veri.baslik;
+        ctx.fillText(etiket, n.x, n.y + 20 / durum.olcek);
+      });
+    }
+    ctx.restore();
+  }
+
+  function grafBul(durum, olay) {
+    const rect = $('graf-tuval').getBoundingClientRect();
+    const x = (olay.clientX - rect.left - durum.panX) / durum.olcek;
+    const y = (olay.clientY - rect.top - durum.panY) / durum.olcek;
+    let en = null, mesafe = 14 / durum.olcek;
+    durum.dugumler.forEach(function (n) {
+      const d = Math.sqrt((n.x - x) * (n.x - x) + (n.y - y) * (n.y - y));
+      if (d < mesafe) { mesafe = d; en = n; }
+    });
+    return en;
+  }
+
+  function grafSec(durum, n) {
+    durum.secili = n ? n.veri.id : null;
+    const kutu = $('graf-secim');
+    if (!n) { kutu.hidden = true; return; }
+    kutu.hidden = false;
+    kutu.replaceChildren(
+      el('div', { class: 'etiket', text: n.veri.tur }),
+      el('h2', { text: n.veri.baslik }),
+      el('p', { class: 'ust-bilgi', text: n.veri.id })
+    );
+  }
+
+  function grafDongu(tuval, durum, ctx, dpr) {
+    const ciz = function () {
+      if (aktifGraf !== durum || !tuval.isConnected) { return; }
+      if ($('gorunum-graf').hidden) { requestAnimationFrame(ciz); return; }
+      if (durum.kare < 260) { grafFizik(durum); durum.kare += 1; }
+      grafCiz(durum, ctx, dpr);
+      requestAnimationFrame(ciz);
+    };
+    requestAnimationFrame(ciz);
+  }
+
+  function grafEtkilesim(tuval, durum) {
+    let surukle = null, pan = null;
+    tuval.addEventListener('pointerdown', function (olay) {
+      tuval.setPointerCapture(olay.pointerId);
+      const n = grafBul(durum, olay);
+      if (n) { durum.sabit = n; grafSec(durum, n); }
+      else if (durum.secili) { grafSec(durum, null); }
+      else { pan = { x: olay.clientX, y: olay.clientY, panX: durum.panX, panY: durum.panY }; }
+      surukle = n;
+    });
+    tuval.addEventListener('pointermove', function (olay) {
+      if (surukle) {
+        const rect = tuval.getBoundingClientRect();
+        surukle.x = (olay.clientX - rect.left - durum.panX) / durum.olcek;
+        surukle.y = (olay.clientY - rect.top - durum.panY) / durum.olcek;
+      } else if (pan) {
+        durum.panX = pan.panX + (olay.clientX - pan.x);
+        durum.panY = pan.panY + (olay.clientY - pan.y);
+      }
+    });
+    const bitir = function () { surukle = null; pan = null; durum.sabit = null; };
+    tuval.addEventListener('pointerup', bitir);
+    tuval.addEventListener('pointercancel', bitir);
+    tuval.addEventListener('wheel', function (olay) {
+      olay.preventDefault();
+      const rect = tuval.getBoundingClientRect();
+      const mx = olay.clientX - rect.left, my = olay.clientY - rect.top;
+      const faktor = olay.deltaY < 0 ? 1.12 : 1 / 1.12;
+      const yeni = Math.min(3, Math.max(0.25, durum.olcek * faktor));
+      durum.panX = mx - (mx - durum.panX) * (yeni / durum.olcek);
+      durum.panY = my - (my - durum.panY) * (yeni / durum.olcek);
+      durum.olcek = yeni;
+    }, { passive: false });
+  }
+
+  async function graf() {
+    const tuval = $('graf-tuval'), notu = $('graf-notu');
+    notu.textContent = 'Yükleniyor…';
+    try {
+      const veri = await api('/api/graf');
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const rect = tuval.getBoundingClientRect();
+      tuval.width = Math.max(1, Math.round(rect.width * dpr));
+      tuval.height = Math.max(1, Math.round(rect.height * dpr));
+      const ctx = tuval.getContext('2d');
+      const durum = grafSimule(veri);
+      aktifGraf = durum;
+      grafEtkilesim(tuval, durum);
+      grafDongu(tuval, durum, ctx, dpr);
+      notu.textContent = veri.dugumler.length + ' not · ' + veri.kenarlar.length + ' bağlantı';
+    } catch (error) {
+      notu.textContent = error.message;
+    }
+  }
+
   // --- gezinme ------------------------------------------------------------
-  const YUKLE = { kokpit: kokpit, gorevler: gorevler, 'gozden-gecir': gozgecir, arama: null, makbuzlar: makbuzlar, hafiza: hafiza };
+  const YUKLE = { kokpit: kokpit, gorevler: gorevler, graf: graf, 'gozden-gecir': gozgecir, arama: null, makbuzlar: makbuzlar, hafiza: hafiza };
   function goster() {
     let ad = window.location.hash.replace('#', '');
     if (!(ad in YUKLE)) { ad = 'kokpit'; }
@@ -471,6 +655,7 @@ APP_JS = r"""
     $('sikistir').addEventListener('click', sikistir);
     $('yeni-gorev').addEventListener('submit', gorevOlustur);
     $('arama-formu').addEventListener('submit', ara);
+    $('graf-yenile').addEventListener('click', graf);
     $('proje-filtre').addEventListener('change', panoyuCiz);
     ['keydown', 'pointerdown', 'wheel'].forEach(function (name) { window.addEventListener(name, etkinlik, { passive: true }); });
     window.addEventListener('hashchange', goster);
@@ -502,6 +687,7 @@ _INDEX = """<!DOCTYPE html>
     <nav aria-label="Bölümler">
       <a href="#kokpit" data-gorunum="kokpit">Kokpit</a>
       <a href="#gorevler" data-gorunum="gorevler">Görevler</a>
+      <a href="#graf" data-gorunum="graf">Graf</a>
       <a href="#gozden-gecir" data-gorunum="gozden-gecir">Gözden geçir</a>
       <a href="#arama" data-gorunum="arama">Arama</a>
       <a href="#makbuzlar" data-gorunum="makbuzlar">Receipt'ler</a>
@@ -577,6 +763,23 @@ _INDEX = """<!DOCTYPE html>
       <p id="hafiza-notu" class="aciklama"></p>
       <ul id="hafiza-listesi" class="liste"></ul>
       <p><button id="sikistir" type="button">Sıkıştır</button></p>
+    </section>
+    <section id="gorunum-graf" class="gorunum" hidden>
+      <h1>Graf</h1>
+      <p class="aciklama">Vault'taki Markdown notları ve aralarındaki bağlantılar. Düğüme tıklayınca not yolu görünür; boş alanı sürükleyerek gezin, tekerlekle yakınlaştır.</p>
+      <div class="arac-cubugu">
+        <button id="graf-yenile" type="button" class="ikincil">Yenile</button>
+        <span id="graf-notu" class="aciklama"></span>
+        <span class="graf-lejant" aria-hidden="true">
+          <span><i class="n-knowledge"></i>knowledge</span>
+          <span><i class="n-daily"></i>daily</span>
+          <span><i class="n-receipts"></i>receipts</span>
+          <span><i class="n-companion"></i>companion</span>
+          <span><i class="n-diger"></i>diğer</span>
+        </span>
+      </div>
+      <div class="graf-kutu"><canvas id="graf-tuval" aria-label="Not bağlantı grafiği"></canvas></div>
+      <div id="graf-secim" class="kart graf-aciklama" hidden></div>
     </section>
   </main>
 </div>
