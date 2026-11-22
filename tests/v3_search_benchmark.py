@@ -24,7 +24,7 @@ class SearchBenchmarkTest(unittest.TestCase):
     def test_frozen_fixture_identity_and_integrity(self):
         """Ensure benchmark fixture matches frozen SHA-256 digest and structure."""
         fixture, digest = evaluator.read_fixture()
-        self.assertEqual(digest, "cf175a93ffcc19e44c79c00187f504e6992797c9b92a16160adbc19cf8513627")
+        self.assertEqual(digest, "8d24f2bd014a60bb2c5cc9b1d6ada23e6faad205160a4fe95f4458b4d4fca6fd")
         self.assertGreaterEqual(len(fixture["records"]), 35)
         self.assertGreaterEqual(len(fixture["cases"]), 30)
 

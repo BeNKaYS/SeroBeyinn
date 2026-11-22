@@ -62,7 +62,7 @@ class TrackedMachineFilesTest(unittest.TestCase):
         before = snapshot(self.repo)
         report = CLI.tracked_machine_files(self.vault)
         self.assertEqual(report['status'], 'warning')
-        self.assertEqual(report['tracked'], ['.serobeyinn-runtime.json', '.claude/scripts/compile.py', '.claude/settings.local.json', 'SeroBeyinn Guncelle.cmd'])
+        self.assertEqual(report['tracked'], ['.claude/scripts/compile.py', '.claude/settings.local.json', '.serobeyinn-runtime.json', 'SeroBeyinn Guncelle.cmd'])
         self.assertEqual(snapshot(self.repo), before)
 
     def test_same_name_indexed_directory_does_not_expand_findings(self):

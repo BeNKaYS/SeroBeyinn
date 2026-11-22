@@ -1,5 +1,5 @@
 ---
-name: SeroBeyinn
+name: serobeyinn
 description: Obsidian SeroBeyinn kasasında bilgi arar, not ve görevleri günceller, biten işi kaynaklarıyla kaydeder. Tetik - "hatırla", "kasada ara", "bunu not al", "notu güncelle", "görev ekle", "proje durumu", "oturumu kasaya yaz"; kendiliğinden - SeroBeyinn klasöründe anlamlı bir iş biterken. Kullanma - sağlık kontrolü (serobeyinn-doktor), sürüm güncelleme (serobeyinn-guncelle), eski sohbet arşivini topluca içe aktarma (kasada varsa gecmis-import).
 ---
 

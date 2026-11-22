@@ -71,7 +71,7 @@ ACTIVE_VERB_GROUPS = (
 
 # Issue #430: roots that lose their last vowel before a vowel suffix.
 VOWEL_LOSS = (
-    ('şehir', 'şehri'), ('fikir', 'fikri'), ('serobeyinn', 'beyni'), ('metin', 'metninde'),
+    ('şehir', 'şehri'), ('fikir', 'fikri'), ('beyin', 'beyni'), ('metin', 'metninde'),
     ('isim', 'ismini'), ('akıl', 'aklına'), ('kayıt', 'kaydı'), ('kısım', 'kısmı'),
     ('vakit', 'vakti'), ('ağız', 'ağzı'), ('oğul', 'oğlu'), ('ömür', 'ömrü'),
     ('devir', 'devri'), ('devir', 'devrinde'), ('devir', 'devrine'), ('burun', 'burnu'),

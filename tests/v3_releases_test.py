@@ -102,7 +102,7 @@ class ReleasesTest(unittest.TestCase):
             raw['assets'].append(dict(asset, id=457, name=asset['name'] + '.sha256',
                                       browser_download_url=asset['browser_download_url'] + '.sha256'))
             return raw
-        for slug in ('BeNKaYS/SeroBeyinn', 'BeNKaYS/SeroBeyinn'):
+        for slug in ('BeNKaYS/SeroBeyinn',):
             with self.subTest(slug=slug):
                 base = 'https://github.com/' + slug + '/releases/'
                 metadata = releases.release_metadata(with_checksum(base))
@@ -113,15 +113,15 @@ class ReleasesTest(unittest.TestCase):
                 with patch.object(releases, 'fetch_metadata', return_value=(metadata, None)):
                     releases.refresh(state, now=1000)
                 self.assertEqual(releases.cache(state)['release']['release_url'], base + 'tag/v3.1.0')
-        for slug in ('BeNKaYS/SeroBeyinn-evil', 'BeNKaYS/SeroBeyinn2', 'someone/serobeyinn', 'someone/serobeyinn', 'BeNKaYS/SeroBeyinn'):
+        for slug in ('BeNKaYS/SeroBeyinn-evil', 'BeNKaYS/SeroBeyinn2', 'someone/serobeyinn', 'someone/serobeyinn-x'):
             with self.subTest(slug=slug), self.assertRaisesRegex(releases.ReleaseError, 'invalid_asset'):
                 releases.release_metadata(with_checksum('https://github.com/' + slug + '/releases/'))
-        mixed = with_checksum('https://github.com/BeNKaYS/SeroBeyinn/releases/')
-        mixed['assets'][1]['browser_download_url'] = releases.WEB + 'download/v3.1.0/serobeyinn-v3-3.1.0.zip.sha256'
+        mixed = with_checksum(releases.WEB)
+        mixed['assets'][1]['browser_download_url'] = 'https://github.com/someone/serobeyinn/releases/download/v3.1.0/serobeyinn-v3-3.1.0.zip.sha256'
         with self.assertRaisesRegex(releases.ReleaseError, 'invalid_checksum_asset'):
             releases.release_metadata(mixed)
         mixed = with_checksum(releases.WEB)
-        mixed['assets'][1]['browser_download_url'] = 'https://github.com/BeNKaYS/SeroBeyinn/releases/download/v3.1.0/serobeyinn-v3-3.1.0.zip.sha256'
+        mixed['assets'][1]['browser_download_url'] = 'https://github.com/someone/serobeyinn/releases/download/v3.1.0/serobeyinn-v3-3.1.0.zip.sha256'
         with self.assertRaisesRegex(releases.ReleaseError, 'invalid_checksum_asset'):
             releases.release_metadata(mixed)
 

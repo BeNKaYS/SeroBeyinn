@@ -22,7 +22,7 @@
     "template/.claude/scripts/serobeyinn_v3_sync.py": "b7dff824eca10efdb93b739d79f6dad664c278bddd98c63db530befc6e88d2a5",
     "template/.agents/skills/serobeyinn/SKILL.md": "7e13537cebaa001d7eb8e2b814b400e1ec6d898df3194bac789a12a2f1aa877f",
     "tests/v3_preferences_test.py": "bf976a731e169f005b21b2ceef22e90f6b12120d2f7a7d95ba8be54a1efc5a08",
-    "tests/v3_public_entry_test.py": "a563d2b7837be72d687f6d1c0623155d9408f6c286e4ed769950a59b89294389",
+    "tests/v3_public_entry_test.py": "ba25ed57edd555b8b281c8ef2d5486ace8e9f566cb390459a378dab0048f4ec1",
     "tests/v3_sync_test.py": "0256870b844617e860ba7e7dbb231c9e6070380141794f6d3593e9d64b0bfa3c",
     "tests/v3_cli_context_test.py": "00b4a080af89e1bc33904b95fc060bdc6bc74102beacc5de0e5adefef77d5ca6",
     "tests/v3_hook_test.py": "01f62dd9bcbaca3b6dd5447e4f5c429c16aba36d12c965d6905208d72848b71b",

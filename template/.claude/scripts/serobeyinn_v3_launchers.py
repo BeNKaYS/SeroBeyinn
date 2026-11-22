@@ -41,7 +41,7 @@ def plan_launchers(vault, state):
         return {'SeroBeyinn Guncelle.cmd': body.encode('ascii')}
     name = 'SeroBeyinn Güncelle.command' if sys.platform == 'darwin' else 'SeroBeyinn Güncelle.sh'
     shell = ('#!/bin/sh\n' + shlex.join([sys.executable, str(entry), 'update']) +
-             '\nbeyin_update_exit=$?\nprintf "\\nKapatmak icin Enter tusuna basin. "\n' +
+             '\nserobeyinn_update_exit=$?\nprintf "\\nKapatmak icin Enter tusuna basin. "\n' +
              'read -r serobeyinn_update_reply || true\nexit "$serobeyinn_update_exit"\n')
     files = {name: shell.encode('utf-8')}
     if sys.platform.startswith('linux'):

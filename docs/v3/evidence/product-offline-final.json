@@ -23,7 +23,7 @@
     "tests/fixtures/v3/semantic_scenarios.json": "26755d6fb2ab368f5c7b5882cb2dd33ef651404f366bce45a4632deae57099bc",
     "tests/v3_entry_test.py": "7db78816e7e4ebb1b810ed5819bc7f39970ceb44698cfd51cf941305d3813383",
     "tests/v3_hook_test.py": "abe40877a39e675fb7432bf2305517c00132d000350fce80016547e92aca8781",
-    "tests/v3_launchers_test.py": "bae065e1665252c4188184f631373cdc055eb0ca994d5fa4a2cd5f27b15cc68e",
+    "tests/v3_launchers_test.py": "696e50f0cb1b2ece5a5cb50a36d4b747f284efcb7a8ef3dde79b39a7d1daaa1b",
     "tests/v3_migration_test.py": "b62dcc52e7d478386d76b967d0bea472796c8668fecd9dbc842dbc972392fb02",
     "tests/v3_package_helpers.py": "7d63e5c77403889212596d76953262838736e056feb2cbd5ad6bef9ffaa2a12e",
     "tests/v3_product_test.py": "91d52ef31634868dd354b9c5271f6da68899dc8f3972cde01b2336d6af5f965b",
@@ -34,9 +34,9 @@
     "tests/v3_task_create_test.py": "10234ab5bdedce5ce1977daef55d6ff0aa5baf8c2b3f54eedc2d82af9a3a1160",
     "tests/v3_update_test.py": "e0dfa7cf23ea040770d61f8a81fd6d3c9633dbf8cf65df85a425779a104fb191",
     "tests/scripts_test.py": "ef762a7fb88994d20eaa2cbed61f0ebefc1836921c98255d6073b0c70b2dc069",
-    "tests/entrypoint_test.py": "ba0ababa5a208308916e6c49c4850fee8caaede17ede20aa2cb361a8b831f976",
+    "tests/entrypoint_test.py": "86d0a09b682e6c2031a65d63227abb1c24a65f469852e270a9d16c42a1219113",
     "tests/antigravity_test.py": "1cb6122949e5dcdc02d06efefa879730e09c4fa216ffd0f835f0a4db795e4673",
-    "docs/V2-README.md": "5e88d8e30b873f5fb0a9c9f515c45eec6ec41f1b9217512c48c6d2f7c4f1e9a7"
+    "docs/V2-README.md": "0b000e03015475d9d95a364fb1c6669e1682777cbc267d9ca4a7997263fa15c2"
   },
   "source_drift_during_run": false,
   "platform_runs": [

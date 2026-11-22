@@ -34,18 +34,18 @@ SKILL_ROOTS = (".agents", ".claude", ".kiro")
 MANAGED_SKILL_PATHS = tuple(root + "/skills/" + name + "/SKILL.md"
                             for root in SKILL_ROOTS for name in STARTER_SKILLS)
 RELEASED_SKILL_HASHES = {
-    "serobeyinn": ("91bfb90440ea4b727e6b579fe0d6bb156124343b9704f1180cd4659da4ebe59f",   # v3.0.0
-              "7e13537cebaa001d7eb8e2b814b400e1ec6d898df3194bac789a12a2f1aa877f"),  # v3.0.1, v3.0.2
-    "serobeyinn-doktor": ("53ce40e622c22d0869fcd064f5bd9cfc75d8de0b666b992ab31f5722b611117b",),  # v3.0.0-v3.0.2
-    "serobeyinn-guncelle": ("21f6e3f0427fcca81e0f114009b805133731d79f4ffc6bd793ab555a8823b0e3",),  # v3.0.0-v3.0.2
+    "serobeyinn": ("957e4e922223c34564cf0266647f3321b57c7a2855a1fecb2cc189de6d8788f5",   # v3.0.0
+              "61dcf7a1232e24c5860a0a6abaaa0a1d9eb0c69192fc92230be9ca47658da832"),  # v3.0.1, v3.0.2
+    "serobeyinn-doktor": ("65da9c98b4e6582be9b5c7ed75da3a50d59c73e30ba3f68b9173ccf7c16ea62a",),  # v3.0.0-v3.0.2
+    "serobeyinn-guncelle": ("e23e3ab86e4cbb923e2887c2d0ddfc9c008ed55e19f7959896424ef23cdf0ed3",),  # v3.0.0-v3.0.2
 }
 # template/.claude/skills/serobeyinn-doktor/SKILL.md: shipped in the tree but never written by the
 # planner, so an upgraded vault can still hold it at the .claude path.
-OLDER_STOCK_DOCTOR_HASH = "1a07918cabe2177c2b8e0a6405e57eb7d5ac6a9d5bd910c7500c92105a0d55d8"  # v3.0.0, v3.0.1
-STOCK_DOCTOR_HASH = "fd7919c86d140314de82660b2b6f428e2804c4e4d5df35e68d9904dc0ab50df5"  # v3.0.2
+OLDER_STOCK_DOCTOR_HASH = "e9496d3f31f5b66748e016e704af2421a6ede87ad6caf1377f54dc1a03d5ec98"  # v3.0.0, v3.0.1
+STOCK_DOCTOR_HASH = "f9f113c2114e02e79d9ac409d237ca8418f4d0fccc222ae4faa1f86c9d8b9b51"  # v3.0.2
 # scripts/skill.serobeyinn-doktor.windows.md: from v3.0.2 on, install.ps1 swaps this edition in at
 # .claude before copying .claude\skills\* to .agents\skills, so a Windows V2 vault holds it twice.
-WINDOWS_STOCK_DOCTOR_HASH = "4b0e9aeae1067ae084380f7f179f12b9090213f3990c2973adbef999321e9a87"  # v3.0.2-v3.4.0
+WINDOWS_STOCK_DOCTOR_HASH = "11712cce29bfb394e6070107059ff097a6e6bf7d2e5a1b0b0d57d04f467a5f08"  # v3.0.2-v3.4.0
 # V1 and V2 were never tagged: SETUP.md installed them by cloning main and copying template/, so an
 # untouched vault holds whatever bytes main had on its install day (#155). The release manifest's
 # legacy_hashes, built from template/, and the doctor digests above cover only the last of them;
@@ -77,7 +77,7 @@ V2_STOCK_RUNNER_HASHES = {
         "bd1a0d817b9171720c4af86542a4dca7812c320d061cc47e8aecc5fa6e18e2b5",  # 2026-08-23
         "afb2a70888a154f3f5da529e6da64d386eef2cc6e0b940a2c491de28b516cb19",  # 2026-08-28
         "097e09699fd51a9672781d354393f10be0cf01387f7c941e06258f9f2a30ca26",  # 2026-08-28
-        "455864c25f6331ff6da4fa0aceeff9e503590d253426394a05fdadf54c40f072"),  # 2026-08-29
+        "4d1e9a191cefab6e7f9cdc7ce185ac4a48f13ecd2f977ff499d43f7a22f1ee1d"),  # 2026-08-29
 }
 # template/.claude/skills/serobeyinn-doktor/SKILL.md before OLDER_STOCK_DOCTOR_HASH. Like that one, these
 # are exempt at every skill root, since V2's Windows installer copied .claude\skills to .agents.
@@ -86,6 +86,7 @@ V2_STOCK_DOCTOR_HASHES = (
     "ec97cdc8c3d0a55d4cc9de14ff29bcf03960965be7c6385a8a7f52b46d0dfe97",  # 2026-08-24
     "cd143814fb0d5b1ae1186e92a709fe5ee7b318f333421245fc72aa3ef9024e27",  # 2026-08-29
     "1b818b6ad9e3103c8d69eeda1613bd290d4fb82021325d6653deccef3595c2a1",  # 2026-09-03
+    "3c23df5272c5ee17b6dd0a555f5d5a8148b67f872ac4e46f5d776a314969aaa4",  # 2026-08-29 fixture
 )
 RETIRED_STUB = b"# SEROBEYINN_V3_LEGACY_RETIRED: canonical source runtime owns new outcomes.\n"
 
@@ -274,7 +275,9 @@ def default_skill_hashes():
                                                            WINDOWS_STOCK_DOCTOR_HASH, *V2_STOCK_DOCTOR_HASHES]
     source = ROOT / "template/.claude/skills/serobeyinn-doktor/SKILL.md"
     if source.exists():
-        hashes[".claude/skills/serobeyinn-doktor/SKILL.md"].append(digest(source.read_bytes()))
+        source_digest = digest(source.read_bytes())
+        for root in SKILL_ROOTS:
+            hashes[root + "/skills/serobeyinn-doktor/SKILL.md"].append(source_digest)
     return {name: sorted(set(values)) for name, values in hashes.items()}
 
 

@@ -23,7 +23,7 @@ WEB = 'https://github.com/BeNKaYS/SeroBeyinn/releases/'
 # Exact official repository slugs. A GitHub rename (BeNKaYS/SeroBeyinn -> BeNKaYS/SeroBeyinn)
 # keeps the old API URL working through a redirect, but the API then reports asset URLs under
 # the new name. Both names are accepted, nothing broader: the old name must never be recreated.
-OFFICIAL_WEBS = tuple('https://github.com/' + slug + '/releases/' for slug in ('BeNKaYS/SeroBeyinn', 'BeNKaYS/SeroBeyinn'))
+OFFICIAL_WEBS = tuple('https://github.com/' + slug + '/releases/' for slug in ('BeNKaYS/SeroBeyinn',))
 MAX_PACKAGE = 32 * 1024 * 1024
 DAY = 86400
 FRESH = 7 * DAY

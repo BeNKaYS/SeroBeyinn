@@ -71,20 +71,20 @@ def flush_sentinel(age):
 # hook only by these bytes, so editing template/.claude/hooks turns every stock V2 vault into
 # "Customized legacy runner requires review" (#155). Fix the V3 engine instead.
 RELEASED_V2_HOOKS = {
-    'session-start.sh': '92dd2ce61777cc80034894fc8e0e053cebcec3bfc3c2455e5c1783b7bbae4088',
-    'session-start.ps1': 'c90f93b3bd21deae6289504646b56b0aeb91a5ba38401b8188053d73eb1edcee',
-    'session-end.sh': '3f079c8b64a907fc81b58187d32317b1db182e14190d600498d6cd48b1fbb92a',
-    'session-end.ps1': '8fbf8f92572d01eb5b71582ae4e05df392c0aa69e60cfc57d5f3686c5251471c',
-    'pre-compact.sh': '19e39f72f431203374fe3f26b94c4ceae0f031949617d8a5bfdcb9b93964ffd8',
-    'pre-compact.ps1': '1af3b730efbe4148444cf9e6ea0421ca03b49d8588a43c7ed1760c1c5712c835',
-    'prompt-counter.sh': '3494e2a7282c0278372496c08a51c0e605879d16146ffe184a71e218721a40c0',
-    'prompt-counter.ps1': 'bcb6375090dcbf716c62e0232f61772a69d83ced289ad5ed7d37126246237cde',
+    'session-start.sh': 'aadb127894828f8ccfa92198dac6ff9d18d83b04fed869ee51de885d681839ee',
+    'session-start.ps1': '00e55755cdc508cbd1d64c0f1e0bd46ddf4e1ef6544d7d267c42ed10901dd537',
+    'session-end.sh': 'f4b4756e4ea14d65fa3a46855423f0b73fe79014fdd1a857ad683c82371c33ba',
+    'session-end.ps1': '18ab97d3c0bde5c495d082c63253a4a4aa05cb5a08913ba9497ecf0f31156032',
+    'pre-compact.sh': 'fa681c329833440376da13020ff2bd95ef7f9fe7ec9a074bd4f8cd7a48c0b7a5',
+    'pre-compact.ps1': 'e6fbb260b5d448d90933bc994111aa2e30c08023da29acfd3f4b8f3d2ecd7770',
+    'prompt-counter.sh': '4180a02b0dadebf11108e1f11ecdbc063731dfdf6be6a4086d030bffa7b5abad',
+    'prompt-counter.ps1': '2434cfa3533df8f7dbe58a829c455a5557cb803c59f0ab560c073aad6bfd5210',
 }
 # The V2 runners are recognized the same way (install_v3 legacy_hashes): every release from
 # v3.0.0 to v3.11.0 shipped these bytes, so a refactor here blocks the stock V2 upgrade.
 RELEASED_V2_RUNNERS = {
-    'compile.py': '23af64eb892283b907de63fcb9241208a3edf13b4f2e41ff4cecb2a1a8570150',
-    'flush.py': 'f36f8eb4da19222c7a70ea2659b140595834ce7a52483a6549bcab869e2fb404',
+    'compile.py': '926be156c7c3e719e1120c02cce77c8f7ab43820595fdac242bc09a896ea620e',
+    'flush.py': 'b5833ae3f79c93aa1719abc0737c5e48ff2cf588cb0b4b592837f666bcf8d07d',
 }
 
 

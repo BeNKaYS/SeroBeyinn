@@ -1,6 +1,6 @@
 {
   "schema": "decision-delivery-v1",
-  "fixture_sha256": "64e97a5c91ebbd8a901653bf433c6e15ad7937ee1c3cfded909cd697833f53bc",
+  "fixture_sha256": "401a63d082c890002595e0faa7aa2bb943368ddc917db9f30921467b5624c144",
   "base_commit": "e112d8af8ec3cc205a2f5aa4994ec337a1460ec8",
   "source": "e112d8af8ec3cc205a2f5aa4994ec337a1460ec8",
   "transport": "label-driven-ideal-selector-NOT-live-Jev",
