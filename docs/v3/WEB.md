@@ -29,7 +29,14 @@ reddeder ve kapanır; yeni sürümle `serobeyinn.py web ac` ile yeniden açılı
 | Arama | ajanların bağlam için kullandığı dizin | yok |
 | Gözden geçir | Gelen Kutusu klasör sayıları, bayat konular/görevler ve taslaklar | yok |
 | Receipt'ler | son 14 günün receipt'leri | yok |
+| Graf | dizinden görünen notlar ve `[[bağlantı]]` / Markdown bağlantıları | yok |
 | Hafıza | `companion-compact --dry-run` planı | `companion-compact` (eski girdileri arşive aynen taşır, silmez) |
+
+**Graf** görünümü notları klasörlerine göre renklendirilmiş bir tuvalde gösterir; bir düğüme
+tıklayınca sağ panelde o notun ham Markdown metni açılır. Düğümler ve kenarlar dizinden gelir:
+henüz eşitlenmemiş, gizli, güvenilmeyen ya da kasa sınıfı bir not ne tuvalde ne de önizlemede
+görünür. Bağlantılar `[[wiki]]`, `[[wiki|etiket]]` ve göreli Markdown bağlantılarıdır; dış
+adresler (`https://…`) kenar üretmez.
 
 Üst köşedeki **Eşitle** düğmesi `serobeyinn.py sync` ile aynı işi yapar. Web görünümü vault'a kendi
 başına dosya yazmaz: her yazma, CLI komutunun kendisi aynı süreçte çalıştırılarak yapılır; revizyon
@@ -47,7 +54,9 @@ Okumalar çekirdek dizinin kendi kapısından geçer: `visibility: private` notl
 hariç tutulan klasörler ve kaynağı dizinden sonra değişmiş notlar arama sonuçlarında, görev
 listesinde ve önizlemede görünmez; kimliği bilinse bile açılamaz ya da güncellenemez. Gizli bir
 kaynağa bağlı receipt özeti gösterilmez. Herhangi bir vault yolu doğrudan istenemez; önizleme
-yalnız dizindeki bir kaydın kimliğiyle açılır.
+yalnız dizindeki bir kaydın kimliğiyle açılır. Graf da bu kapıdan beslenir: gizli, güvenilmeyen,
+kasa sınıfı ya da henüz eşitlenmemiş bir not düğüm olarak görünmez; yolu bilinse bile not
+önizlemesi (`/api/not`) onu açmaz.
 
 ## Güvenlik
 

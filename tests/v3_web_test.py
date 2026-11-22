@@ -22,6 +22,7 @@ import threading
 import time
 import unicodedata
 import unittest
+import urllib.parse
 from unittest.mock import patch
 import zipfile
 
@@ -322,6 +323,53 @@ class WebPrivacyTest(WebFixture):
         self.core.run('sync')
         status, found = self.get_json('/api/ara?q=' + PUBLIC, cookie)
         self.assertEqual(found['sonuclar'], [])
+
+
+class WebGraphTest(WebFixture):
+    """Graf ve not önizlemesi, arama ve kayıt önizlemesiyle aynı dizin kapısından geçer."""
+
+    def test_graf_lists_only_indexed_visible_notes_and_their_links(self):
+        self.write('notes/hedef.md', '# Hedef not\n\nBağlantı hedefi.\n')
+        self.write('notes/kaynak.md', '# Kaynak not\n\n[[hedef|Hedef not]] ve [dış](https://example.com).\n')
+        self.core.run('sync')
+        self.write('notes/senkronsuz.md', '# Eşitlenmemiş not\n\nBu not dizinde yok.\n')
+        cookie, _ = self.login()
+        status, data = self.get_json('/api/graf', cookie)
+        self.assertEqual(status, 200)
+        nodes = {node['id']: node for node in data['dugumler']}
+        self.assertEqual(nodes['notes/kaynak.md'], {'id': 'notes/kaynak.md', 'baslik': 'Kaynak not', 'tur': 'notes'})
+        self.assertEqual(nodes['notes/hedef.md']['tur'], 'notes')
+        self.assertIn('notes/acik.md', nodes)
+        self.assertNotIn('notes/senkronsuz.md', nodes)  # dizinde olmayan not düğüm olmaz
+        for hidden in ('notes/gizli.md', 'notes/disaridan.md',
+                       unicodedata.normalize('NFD', 'Müşteri Kasası') + '/m.md'):
+            self.assertNotIn(hidden, nodes)
+        self.assertIn({'kaynak': 'notes/kaynak.md', 'hedef': 'notes/hedef.md'}, data['kenarlar'])
+        self.assertFalse([edge for edge in data['kenarlar'] if 'senkronsuz' in json.dumps(edge)])
+
+    def test_note_preview_opens_only_what_the_index_shows(self):
+        self.write('notes/belge.txt', 'Markdown değil.\n')
+        cookie, _ = self.login()
+        status, note = self.get_json('/api/not?yol=' + urllib.parse.quote('notes/acik.md'), cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual((note['yol'], note['kisaltildi']), ('notes/acik.md', False))
+        self.assertIn(PUBLIC, note['metin'])
+        for hidden in ('notes/gizli.md', 'notes/disaridan.md', 'notes/yok.md', 'notes/belge.txt',
+                       unicodedata.normalize('NFD', 'Müşteri Kasası') + '/m.md'):
+            status, body = self.get_json('/api/not?yol=' + urllib.parse.quote(hidden), cookie)
+            self.assertEqual(status, 404, hidden)
+            self.assertNotIn('metin', body)
+        for outside in ('../kasa-disi.md', '/etc/hosts'):
+            status, body = self.get_json('/api/not?yol=' + urllib.parse.quote(outside), cookie)
+            self.assertEqual(status, 400, outside)
+            self.assertNotIn('metin', body)
+        status, _ = self.get_json('/api/not?yol=', cookie)
+        self.assertEqual(status, 400)
+        # Gizliye çevrilen not, yeniden eşitlenene kadar tazelik kapısında düşer.
+        self.write('notes/acik.md', f'---\ntitle: Açık not\nvisibility: private\n---\nHerkese açık {PUBLIC} içerik.\n')
+        status, body = self.get_json('/api/not?yol=notes/acik.md', cookie)
+        self.assertEqual(status, 404)
+        self.assertNotIn('metin', body)
 
 
 class WebWriteTest(WebFixture):

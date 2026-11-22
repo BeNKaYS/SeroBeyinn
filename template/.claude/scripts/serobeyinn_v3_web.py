@@ -134,20 +134,28 @@ _WIKI_RE = re.compile(r'\[\[([^\]\n]+)\]\]')
 _MD_LINK_RE = re.compile(r'(?<!!)\[[^\]\n]*\]\(\s*<?([^()<>\s]+)>?\s*(?:"[^"]*")?\s*\)')
 
 
+def _visible_notes(core):
+    """Vault Markdown kaynakları; retrieval ile aynı gizlilik, güven ve tazelik kapısından geçer."""
+    store = core.store()
+    records = store._records()
+    superseded = store._superseded_ids(records)
+    eligible, _ = store._eligible('internal', records=records)
+    return {record['source']: record for record in eligible
+            if record['id'] not in superseded and isinstance(record.get('source'), str)
+            and record['source'].endswith('.md')}
+
+
 def _graph(core):
-    """Vault Markdown notları ve aralarındaki bağlantılar; gizli klasörler dışarıda kalır."""
-    vault = Path(getattr(core, 'vault', '.')).resolve()
+    """Vault Markdown notları ve aralarındaki bağlantılar; yalnız dizinden görünen notlar girer."""
+    vault = Path(core.vault).resolve()
     nodes, by_key, edges, files = {}, {}, set(), []
-    for path in sorted(vault.rglob('*.md')):
-        try:
-            rel = path.relative_to(vault).as_posix()
-        except ValueError:
-            continue
+    for rel in sorted(_visible_notes(core)):
+        path = vault / rel
         parts = rel.split('/')
-        if any(part.startswith('.') or part in _GRAPH_SKIP for part in parts[:-1]):
+        if any(part.startswith('.') or part in _GRAPH_SKIP for part in parts[:-1]) or not path.is_file():
             continue
         files.append((rel, path))
-        by_key.setdefault(rel[:-3].casefold() if rel.casefold().endswith('.md') else rel.casefold(), rel)
+        by_key.setdefault(rel[:-3].casefold(), rel)
         by_key.setdefault(path.stem.casefold(), rel)
     for rel, path in files:
         try:
@@ -176,8 +184,8 @@ def _graph(core):
 
 
 def _note(core, relative):
-    """Graf düğümünün ham Markdown metni; kasa dışı ve gizli yollar reddedilir."""
-    vault = Path(getattr(core, 'vault', '.')).resolve()
+    """Graf düğümünün ham Markdown metni; yalnız dizinden görünen bir yol açılır."""
+    vault = Path(core.vault).resolve()
     if not isinstance(relative, str) or not relative.strip():
         raise WebError(400, 'Not yolu gerekli')
     target = (vault / relative).resolve()
@@ -190,6 +198,8 @@ def _note(core, relative):
         raise WebError(403, 'Bu not gösterilmiyor')
     if target.suffix.lower() != '.md' or not target.is_file():
         raise WebError(404, 'Not bulunamadı')
+    if rel not in _visible_notes(core):
+        raise WebError(404, 'Kayıt bulunamadı ya da bu görünümde gösterilmiyor')
     text = target.read_text(encoding='utf-8', errors='replace')
     return {'yol': rel, 'metin': text[:200000], 'kisaltildi': len(text) > 200000}
 

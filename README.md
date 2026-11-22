@@ -147,7 +147,9 @@ Varsayılan **Enter** yalnız kartı kaydeder. İstersen Claude Code veya Codex 
 
 ## Beynine tarayıcıdan bak
 
-Görevlerini, son iş sonuçlarını ve doktor özetini tek ekranda gör. İsteğe bağlı web görünümünü **vault klasöründe** aç:
+Görevlerini, son iş sonuçlarını ve doktor özetini tek ekranda gör. **Graf** görünümü notlarını ve
+aralarındaki bağlantıları gösterir; düğüme tıklayınca not sağ panelde açılır. İsteğe bağlı web
+görünümünü **vault klasöründe** aç:
 
 ```sh
 python3 serobeyinn.py web ac
