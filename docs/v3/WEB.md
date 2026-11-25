@@ -24,13 +24,15 @@ reddeder ve kapanır; yeni sürümle `serobeyinn.py web ac` ile yeniden açılı
 
 | Bölüm | Kaynak | Yazma |
 | --- | --- | --- |
-| Kokpit | `doctor` özeti, açık görev sayıları, son receipt'ler | yok |
+| Kokpit | `doctor` özeti, odak görevler, hafıza doluluğu, son kayıtlar | hızlı görev `task-create`, özel başlık |
 | Görevler | `tasks/` altındaki görev kayıtları (`kind: task`) | yeni görev `task-create`, durum değişikliği `task-update` |
-| Arama | ajanların bağlam için kullandığı dizin | yok |
+| Graf | dizinden görünen notlar ve bağlantılar (iki yarımküreli Beyin Haritası / Serbest mod + Türkçe modül filtreleri) | yok |
 | Gözden geçir | Gelen Kutusu klasör sayıları, bayat konular/görevler ve taslaklar | yok |
-| Receipt'ler | son 14 günün receipt'leri | yok |
-| Graf | dizinden görünen notlar ve `[[bağlantı]]` / Markdown bağlantıları | yok |
-| Hafıza | `companion-compact --dry-run` planı | `companion-compact` (eski girdileri arşive aynen taşır, silmez) |
+| Arama | ajanların bağlam için kullandığı dizin (Markdown okuyucu önizlemesiyle) | yok |
+| İşlem Kayıtları (Receipts) | son 14 günün kayıtları (gün gruplu akış ve anlık filtre) | yok |
+| Hafıza | `companion-compact --dry-run` planı + çekirdek dosya Markdown okuyucusu | `companion-compact` (eski girdileri arşive aynen taşır, silmez) |
+| Güncelleme | GitHub resmi release (`BeNKaYS/SeroBeyinn`) veya yerel `.zip` paketi | onaylı & yedekli `serobeyinn_v3_update.update` |
+| Yardım | çalışma mantığı, sohbet hafıza tetikleyicileri, menüler ve güvenlik püf noktaları | yok |
 
 **Graf** görünümü notları klasörlerine göre renklendirilmiş bir tuvalde gösterir; bir düğüme
 tıklayınca sağ panelde o notun ham Markdown metni açılır. Düğümler ve kenarlar dizinden gelir:

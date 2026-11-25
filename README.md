@@ -32,7 +32,7 @@ flowchart TB
 
 Asıl kaynak dosyaların. SeroBeyinn bunların yerel indeksini tutar ve seçilen bağlamı kullandığın AI istemcisine verir. Sohbet geçmişinin tamamını kendiliğinden bilgiye dönüştürmez; kalıcı olmasını istediğin şeyi nota yazdırırsın.
 
-> **V3.14.1'de yeni:** İsteğe bağlı [video motoru](extras/video-motoru/README.md) paketi geldi: boş başlar, her videoda markanı ve düzeltmelerini not alarak gelişir. [Sürüm notu](docs/v3/releases/3.14.1.md). Önceki sürümün yenilikleri: [3.14.0](docs/v3/releases/3.14.0.md).
+> **V3.15.0'da yeni:** Yerel web arayüzüne iki yarımküreli **Beyin Haritası (`#graf`)**, güvenli **Markdown okuyucu**, **İşlem Kayıtları (Receipts)** zaman çizelgesi, **Hafıza** dosya okuyucusu, kapsamlı **Yardım (`#yardim`)** ve arayüz içi **Güncelleme (`#guncelleme`)** paneli eklendi; sohbet selamlamalarında (`merhaba / selam / nasılsın`) projedeki açık `@ajan` görevlerini hatırlatma desteği geldi. Önceki sürümler: [3.14.1](docs/v3/releases/3.14.1.md) · [3.14.0](docs/v3/releases/3.14.0.md).
 
 <a id="kurulum"></a>
 ## Üç adımda kurulum
@@ -147,9 +147,7 @@ Varsayılan **Enter** yalnız kartı kaydeder. İstersen Claude Code veya Codex 
 
 ## Beynine tarayıcıdan bak
 
-Görevlerini, son iş sonuçlarını ve doktor özetini tek ekranda gör. **Graf** görünümü notlarını ve
-aralarındaki bağlantıları gösterir; düğüme tıklayınca not sağ panelde açılır. İsteğe bağlı web
-görünümünü **vault klasöründe** aç:
+Kokpit, Görevler (Kanban), **Beyin Haritası (`#graf`)**, Gözden geçir, Arama, **İşlem Kayıtları (Receipts)**, **Hafıza**, **Güncelleme** ve **Yardım** sekmelerini tek yerel arayüzde kullan. Düğüme veya arama sonucuna tıklayınca not sağ panelde okunabilir Markdown biçiminde açılır; sol üstteki başlığı dilediğin gibi özelleştirebilirsin. İsteğe bağlı web görünümünü **vault klasöründe** aç:
 
 ```sh
 python3 serobeyinn.py web ac
@@ -163,7 +161,7 @@ Yalnız bu bilgisayarda açılır; 30 dakika kullanılmazsa kapanır. Kurulum s�
 
 ## Güncelleme ve yardım
 
-Güncellemek için ajanına **“beynimi güncelle”**, sorun varsa **“serobeyinn-doktor ile kontrol et”** de. Terminal tercih edersen **vault klasöründe**:
+Web arayüzündeki **Güncelleme (`#guncelleme`)** sekmesinden GitHub resmi sürümünü veya yerel `.zip` paketini kontrol edip onaylı/yedekli biçimde güncelleyebilir, **Yardım (`#yardim`)** sekmesinden tüm menü ve hafıza tetikleyicilerini görebilirsin. Sohbette ajanına **“beynimi güncelle”** veya **“serobeyinn-doktor ile kontrol et”** de diyebilirsin. Terminal tercih edersen **vault klasöründe**:
 
 ```sh
 python3 serobeyinn.py update --check   # Yeni sürümü kontrol et
