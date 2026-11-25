@@ -191,7 +191,7 @@ def prompt_text(payload):
     """The user's prompt as text; retrieval and the opt-out check need a string. Claude Code (checked on 2.1.285,
     where task notifications arrive as <task-notification> text), Codex and the bundled OpenCode, Hermes and OMP
     adapters send a string; null or a list of content blocks from any other caller must not crash the turn."""
-    prompt = payload.get("prompt") if isinstance(payload, dict) else None
+    prompt = (payload.get("prompt") if payload.get("prompt") is not None else payload.get("lastUserInput")) if isinstance(payload, dict) else None
     if isinstance(prompt, str):
         return prompt
     if isinstance(prompt, list):
@@ -668,6 +668,79 @@ def drain_queue(vault, state, maintenance=False):
     return {"processed": 0, "failed": len(pending), "pending": len(pending)}
 
 
+_AGENT_OWNERS = frozenset({'ajan', 'agent', 'claude', 'codex', 'antigravity', 'ai'})
+_OPEN_TASK_STATUSES = {'active': 0, 'inbox': 1, 'waiting': 2, 'blocked': 3}
+_GREETING_RE = re.compile(
+    r'\b(merhaba|selam|slm|mrb|nasilsin|nasilsiniz|naber|gunaydin|iyi\s+aksamlar|iyi\s+gunler|kolay\s+gelsin|hey|hi|hello)\b'
+)
+
+
+def _fold_tr(text):
+    table = str.maketrans('çğıİöşüÇĞÖŞÜ', 'cgiiösuCGOSU'.replace('ö', 'o'))
+    return text.translate(table).casefold()
+
+
+def _is_greeting_prompt(query):
+    if not isinstance(query, str):
+        return False
+    cleaned = ' '.join(query.strip().split())
+    if not cleaned or len(cleaned) > 80:
+        return False
+    return bool(_GREETING_RE.search(_fold_tr(cleaned)))
+
+
+def _is_agent_owner(value):
+    if not isinstance(value, str):
+        return False
+    norm = value.strip().casefold().lstrip('@')
+    if not norm:
+        return False
+    return norm in _AGENT_OWNERS or norm.startswith(('ajan-', 'ajan_', 'agent-', 'agent_'))
+
+
+def _agent_tasks_notice(store, active_project=None, cwd_name=None, strict_scope=False):
+    """Greeting/SessionStart hint for open tasks owned by an agent, prioritizing the active project."""
+    records = store._records()
+    superseded = store._superseded_ids(records)
+    tasks = [r for r in records
+             if r.get('kind') == 'task'
+             and r['id'] not in superseded
+             and r.get('status') in _OPEN_TASK_STATUSES
+             and _is_agent_owner(r.get('owner'))]
+    if not tasks:
+        return ''
+    eligible, _ = store._eligible('internal', records=tasks)
+    if not eligible:
+        return ''
+    candidates = {p.strip().casefold() for p in (active_project, cwd_name) if isinstance(p, str) and p.strip()}
+    matched = [r for r in eligible
+               if isinstance(r.get('project'), str) and r['project'].strip().casefold() in candidates]
+    scoped = bool(matched)
+    if strict_scope and not scoped:
+        return ''
+    selected = matched if scoped else eligible
+    selected.sort(key=lambda r: (_OPEN_TASK_STATUSES.get(r.get('status'), 9),
+                                 str(r.get('due_at') or '9999'),
+                                 str(r.get('title') or r['id']).casefold()))
+    shown = selected[:5]
+    lines = []
+    for r in shown:
+        title = str(r.get('title') or r['id']).strip()[:120]
+        proj = f' #{r["project"]}' if isinstance(r.get('project'), str) and r['project'].strip() else ''
+        lines.append(f'- {title}{proj} [{r.get("status")}, @{r.get("owner")}]')
+    extra = f' (+{len(selected) - len(shown)} gorev daha)' if len(selected) > len(shown) else ''
+    if scoped:
+        proj_label = active_project or cwd_name
+        header = f'[Ajan Gorevleri - {proj_label}] Bu projede sorumlusu ajan olan {len(selected)} acik gorev var{extra}:\n'
+        prompt = ('Kullanici merhaba/selam/nasilsin gibi bir girisle sohbete basladiysa bu projedeki bu gorevleri '
+                  'kisaca hatirlatip "Bu projede su gorevim vardi, devam edeyim mi?" diye sor; onay gelmeden baslama.\n')
+    else:
+        header = f'[Ajan Gorevleri] Sorumlusu ajan olan {len(selected)} acik gorev var{extra}:\n'
+        prompt = ('Kullanici merhaba/selam/nasilsin gibi bir girisle sohbete basladiysa sorumlusu ajan olan bu gorevleri '
+                  'kisaca hatirlatip devam etmek isteyip istemedigini sor; onay gelmeden baslama.\n')
+    return header + '\n'.join(lines) + '\n' + prompt
+
+
 def main():
     started = time.monotonic()
     if hasattr(sys.stdin, "reconfigure"):
@@ -719,9 +792,13 @@ def main():
         if args.harness == "antigravity":
             if event == "PreInvocation":
                 if payload.get("invocationNum") != 0:
-                    print("{}")
-                    return
-                event = "SessionStart"
+                    if _is_greeting_prompt(prompt_text(payload)):
+                        event = "UserPromptSubmit"
+                    else:
+                        print("{}")
+                        return
+                else:
+                    event = "SessionStart"
             elif event == "Stop" and payload.get("fullyIdle") is not True:
                 print('{"decision":"stop"}')
                 return
@@ -968,16 +1045,38 @@ def main():
             # A text over the client's own measure is rendered once more with a scaled budget.
             limit = client_budget(args.harness, settings['context_chars'])
             receipt = receipt_context(vault, state)
+            _cwd = None
+            _external_dir = False
+            try:
+                from serobeyinn_v3_bridge import working_directory
+                _cwd = working_directory(payload, args.harness)
+                if _cwd is not None:
+                    _v_res = Path(vault).resolve()
+                    _c_res = Path(_cwd).resolve()
+                    _external_dir = (_c_res != _v_res and not _c_res.is_relative_to(_v_res))
+            except Exception:
+                _cwd = None
+                _external_dir = False
+            greeting_turn = event == 'UserPromptSubmit' and _is_greeting_prompt(query)
+            if event == 'SessionStart' or greeting_turn:
+                try:
+                    from serobeyinn_v3_projects import resolve_active_project
+                    _cwd_name = Path(_cwd).name if _cwd else None
+                    _proj = project or (resolve_active_project(vault, _cwd) if _cwd else None)
+                    if greeting_turn or (event == 'SessionStart' and (not query or _is_greeting_prompt(query))):
+                        warning += _agent_tasks_notice(store, active_project=_proj, cwd_name=_cwd_name,
+                                                       strict_scope=_external_dir)
+                except Exception:
+                    pass
             if event == 'SessionStart' or relevant(query):
                 # Claude Code and Antigravity send a working directory, not a project (#288, #403).
                 # A project found from it selects the project rules only: as a retrieval scope it
                 # would hide every note that does not carry that project field.
                 rules_project = project
                 if rules_project is None:
-                    from serobeyinn_v3_bridge import working_directory
                     from serobeyinn_v3_projects import resolve_active_project, resolve_project_from_query
                     try:
-                        rules_project = resolve_active_project(vault, working_directory(payload, args.harness))
+                        rules_project = resolve_active_project(vault, _cwd) if _cwd else None
                     except Exception:
                         rules_project = None
                     if rules_project is None and query:
@@ -985,18 +1084,19 @@ def main():
                             rules_project = resolve_project_from_query(vault, query)
                         except Exception:
                             rules_project = None
+                threads_project = rules_project or (Path(_cwd).name if (_external_dir and _cwd) else None)
                 # Local import syntax cannot prove client delivery. Keep the normal
                 # companion text, including after resume/compact and continuity questions.
                 # The opening may carry its own machine-local budget (#140); never a vault preference.
                 opening_limit = client_budget(args.harness, opening_budget(state, settings['context_chars']))
                 limit = opening_limit
                 text = companion_context(store, max(0, limit - len(notice)), session, args.harness, query, receipt, warning, project=project,
-                                         rules_project=rules_project)
+                                         rules_project=rules_project, threads_project=threads_project)
                 smaller = client_rebudget(args.harness, limit, notice + text)
                 if smaller is not None and smaller < limit:
                     limit = smaller
                     text = companion_context(store, max(0, limit - len(notice)), session, args.harness, query, receipt, warning,
-                                             project=project, rules_project=rules_project)
+                                             project=project, rules_project=rules_project, threads_project=threads_project)
                     if client_rebudget(args.harness, limit, notice + text) is not None:
                         # Protected sections can change the Unicode ratio after a
                         # render. Bound further work by bisecting integer budgets:
@@ -1009,7 +1109,7 @@ def main():
                             trial = (low + high) // 2
                             candidate = companion_context(store, max(0, trial - len(notice)), session, args.harness,
                                                           query, receipt, warning, project=project,
-                                                          rules_project=rules_project)
+                                                          rules_project=rules_project, threads_project=threads_project)
                             if client_rebudget(args.harness, trial, notice + candidate) is None:
                                 low, fitting = trial, candidate
                             else:

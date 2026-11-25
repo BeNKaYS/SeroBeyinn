@@ -387,13 +387,37 @@ class Core:
 
     def memory(self):
         result = self.run('companion-compact', '--dry-run')
+        directory = _text(result.get('directory'))
+        try:
+            visible = _visible_notes(self)
+        except WebError:
+            visible = {}
         files = []
+        seen = set()
         for name, entry in sorted((result.get('files') or {}).items()):
             if isinstance(entry, dict):
+                rel = f'{directory}/{name}' if directory else name
+                seen.add(name)
                 files.append({'ad': name, 'karakter': entry.get('chars'), 'sinir': entry.get('limit'),
-                              'durum': _text(entry.get('status')), 'tasinacak': entry.get('moved_chars')})
-        return {'durum': _text(result.get('status')), 'dizin': _text(result.get('directory')), 'dosyalar': files,
-                'neden': _text(result.get('reason'))}
+                              'durum': _text(entry.get('status')), 'tasinacak': entry.get('moved_chars'),
+                              'yol': rel if rel in visible else None})
+        core_files = []
+        if directory:
+            prefix = directory.rstrip('/') + '/'
+            for rel in sorted(visible):
+                if not rel.startswith(prefix):
+                    continue
+                name = rel[len(prefix):]
+                if '/' in name or name in seen:
+                    continue
+                path = self.vault / rel
+                try:
+                    chars = len(path.read_text(encoding='utf-8', errors='replace'))
+                except OSError:
+                    chars = None
+                core_files.append({'ad': name, 'yol': rel, 'karakter': chars})
+        return {'durum': _text(result.get('status')), 'dizin': directory, 'dosyalar': files,
+                'cekirdek': core_files, 'neden': _text(result.get('reason'))}
 
     def create_task(self, data):
         title = _line(data.get('baslik'), 160)
@@ -437,6 +461,90 @@ class Core:
         result = self.run('companion-compact')
         moved = {name: entry.get('status') for name, entry in (result.get('files') or {}).items() if isinstance(entry, dict)}
         return {'durum': _text(result.get('status')), 'dosyalar': moved, 'neden': _text(result.get('reason'))}
+
+    def update_status(self):
+        info = releases.status(self.vault, self.state)
+        return {
+            'mevcut': self.version(),
+            'durum': _text(info.get('status')),
+            'hedef': _text(info.get('latest_version')),
+            'kontrol_zamani': _text(info.get('checked_at')),
+            'yarim_islem': bool(releases.pending_transaction(self.state)),
+        }
+
+    def _local_package(self, raw_path):
+        text = _line(raw_path, 500)
+        if not text:
+            raise WebError(400, 'Yerel paket (.zip) yolu gerekli')
+        path = Path(text).expanduser().resolve()
+        if path.suffix.lower() != '.zip' or not path.is_file():
+            raise WebError(400, 'Geçerli bir .zip paket dosyası bulunamadı')
+        return path
+
+    def update_check(self, data):
+        source = _line(data.get('kaynak'), 20) or 'github'
+        if source not in ('github', 'yerel'):
+            raise WebError(400, 'Geçersiz güncelleme kaynağı')
+        if source == 'yerel':
+            package = self._local_package(data.get('paket'))
+            import serobeyinn_v3_update as updater
+            try:
+                res = updater.update(self.vault, self.state, package=package, check=True)
+            except Exception as exc:
+                raise WebError(400, str(exc)[:300])
+            return {'durum': _text(res.get('status')), 'mevcut': _text(res.get('current_version')) or self.version(),
+                    'hedef': _text(res.get('version')), 'kaynak': 'yerel'}
+        try:
+            res = releases.check(self.vault, self.state)
+        except Exception as exc:
+            raise WebError(502, 'GitHub kontrolü tamamlanamadı: ' + str(exc)[:260])
+        return {'durum': _text(res.get('status')), 'mevcut': _text(res.get('current_version')) or self.version(),
+                'hedef': _text(res.get('version')), 'kaynak': 'github'}
+
+    def update_apply(self, data):
+        if data.get('onay') is not True:
+            raise WebError(400, 'Güncelleme için açık onay gerekli')
+        source = _line(data.get('kaynak'), 20) or 'github'
+        if source not in ('github', 'yerel'):
+            raise WebError(400, 'Geçersiz güncelleme kaynağı')
+        package = self._local_package(data.get('paket')) if source == 'yerel' else None
+        import serobeyinn_v3_update as updater
+        try:
+            res = updater.update(self.vault, self.state, package=package, check=False)
+        except Exception as exc:
+            raise WebError(400, 'Güncelleme uygulanamadı: ' + str(exc)[:300])
+        return {'durum': _text(res.get('status')), 'surum': _text(res.get('version')) or self.version(),
+                'kaynak': source}
+
+    def _prefs_path(self):
+        return self.state / 'web' / 'ui-prefs.json'
+
+    def web_title(self):
+        try:
+            data = json.loads(self._prefs_path().read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return 'SeroBeyinn Web'
+        title = _text(data.get('baslik')) if isinstance(data, dict) else None
+        return title.strip()[:60] if title and title.strip() else 'SeroBeyinn Web'
+
+    def set_web_title(self, data):
+        title = _line(data.get('baslik'), 60) or 'SeroBeyinn Web'
+        directory = self.state / 'web'
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle, tmp_name = tempfile.mkstemp(prefix='prefs-', suffix='.json', dir=directory)
+        try:
+            with os.fdopen(handle, 'w', encoding='utf-8') as stream:
+                json.dump({'baslik': title}, stream, ensure_ascii=False)
+            if os.name != 'nt':
+                os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, self._prefs_path())
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        return {'baslik': title}
 
 
 class WebServer(HTTPServer):
@@ -604,8 +712,8 @@ class Handler(BaseHTTPRequestHandler):
             self.server.touch()
         core, query = self.server.core, urllib.parse.parse_qs(url.query)
         routes = {
-            '/api/durum': lambda: {'surum': core.version(), 'kasa': core.vault.name, 'salt_okunur': self.server.read_only,
-                                   'bosta_kapanma_dk': IDLE_SECONDS // 60},
+            '/api/durum': lambda: {'surum': core.version(), 'kasa': core.vault.name, 'baslik': core.web_title(),
+                                   'salt_okunur': self.server.read_only, 'bosta_kapanma_dk': IDLE_SECONDS // 60},
             '/api/doktor': core.doctor,
             '/api/gorevler': core.tasks,
             '/api/ara': lambda: core.search(query.get('q', [''])[0]),
@@ -615,6 +723,7 @@ class Handler(BaseHTTPRequestHandler):
             '/api/graf': lambda: _graph(core),
             '/api/not': lambda: _note(core, query.get('yol', [''])[0]),
             '/api/gozden-gecir': core.review,
+            '/api/guncelleme': core.update_status,
         }
         self._route(routes.get(url.path))
 
@@ -697,7 +806,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         core = self.server.core
         routes = {'/api/gorev': core.create_task, '/api/gorev/durum': core.set_status,
-                  '/api/esitle': lambda _: core.sync(), '/api/hafiza/sikistir': lambda _: core.compact()}
+                  '/api/esitle': lambda _: core.sync(), '/api/hafiza/sikistir': lambda _: core.compact(),
+                  '/api/ayarlar': core.set_web_title, '/api/guncelleme/kontrol': core.update_check,
+                  '/api/guncelleme/uygula': core.update_apply}
         if path in routes and self.server.read_only:
             self._fail(403, 'Sunucu salt okunur modda; yazma kapalı')
             return

@@ -886,7 +886,61 @@ def stamp(header):
     return (date[0], clock[0].rjust(5, '0') if clock else '') if date else None
 
 
-def excerpt(name, text, project=None):
+def _thread_norm(value):
+    text = unicodedata.normalize('NFC', str(value or '')).casefold()
+    spaced = re.sub(r'[\s_\-./]+', ' ', text).strip()
+    return spaced, spaced.replace(' ', '')
+
+
+def _thread_matches_project(block_text, heading_text, active_project):
+    spaced, compact = _thread_norm(active_project)
+    if len(compact) < 2:
+        return True
+    h_spaced, h_compact = _thread_norm(heading_text)
+    if spaced in h_spaced or compact in h_compact:
+        return True
+    for line in block_text.splitlines()[1:6]:
+        if re.match(r'(?i)^\s*[-*]?\s*(?:project|proje|repo|klas[öo]r|dizin)\s*:', line):
+            l_spaced, l_compact = _thread_norm(line)
+            if spaced in l_spaced or compact in l_compact:
+                return True
+    return False
+
+
+def filter_scoped_threads(text, active_project=None):
+    """When active_project is set, keep only Threads.md topics matching that project/folder."""
+    if not active_project or not isinstance(active_project, str) or not active_project.strip():
+        return text
+    matches = list(re.finditer(r'(?m)^### [^\n]+', text))
+    if matches:
+        head = text[:matches[0].start()].rstrip()
+        kept = []
+        for idx, m in enumerate(matches):
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            block = text[m.start():end].rstrip()
+            heading = m.group(0)[4:].strip()
+            if _thread_matches_project(block, heading, active_project):
+                kept.append(block)
+        if kept:
+            return (head + '\n\n' if head else '') + '\n\n'.join(kept) + '\n'
+        return (head + '\n' if head else '') + '(Bu proje için açık konu yok.)\n'
+    lines = text.splitlines()
+    head_lines, bullets = [], []
+    for line in lines:
+        if re.match(r'^\s*[-*]\s+', line):
+            bullets.append(line)
+        elif not bullets:
+            head_lines.append(line)
+    if not bullets:
+        return text
+    kept_bullets = [b for b in bullets if _thread_matches_project(b, b, active_project)]
+    head = '\n'.join(head_lines).rstrip()
+    if kept_bullets:
+        return (head + '\n' if head else '') + '\n'.join(kept_bullets) + '\n'
+    return (head + '\n' if head else '') + '(Bu proje için açık konu yok.)\n'
+
+
+def excerpt(name, text, project=None, threads_project=None):
     if name == 'Threads.md':
         # Recognize named active/open sections, including custom suffixes (#758).
         # Keep a word boundary: Açıklama/Opening are not active headings (#153).
@@ -894,7 +948,9 @@ def excerpt(name, text, project=None):
         if match:
             body = text[match.start():]
             closed = re.search(r'(?im)^## (?:Closed|Kapan|Kapalı)', body)
-            return body[:closed.start()] if closed else body
+            body = body[:closed.start()] if closed else body
+            return filter_scoped_threads(body, active_project=threads_project)
+        return filter_scoped_threads(text, active_project=threads_project)
     if name == 'Journal.md':
         entries = list(re.finditer(r'(?m)^## ([^\n]+)', text))
         dated = [(moment, i) for i, item in enumerate(entries) if (moment := stamp(item[1]))]
@@ -1501,7 +1557,7 @@ def receipt_header(session):
 
 
 def context(store, budget, session, harness, query='', receipt='', warning='', project=None, report=None,
-            rules_project=None, loaded=None):
+            rules_project=None, loaded=None, threads_project=None):
     """Budget actual displayed text, not repeated JSON metadata; never cut a record header.
 
     A dict passed as report receives the companion Kurallar.md share of the returned text
@@ -1527,7 +1583,8 @@ def context(store, budget, session, harness, query='', receipt='', warning='', p
         return clip(header + 'Multiple companion directories: read the user-selected identity sources.\n', budget)
     snapshot = store.source_snapshot(NAMES, budget_chars=200000,
                                      source_directory=target.relative_to(store.vault_root).as_posix(),
-                                     text_transform=lambda name, text: excerpt(name, text, project=rules_project))
+                                     text_transform=lambda name, text: excerpt(
+                                         name, text, project=rules_project, threads_project=threads_project))
     records = snapshot['records']
     notice = ''
     missing = snapshot['missing_sources']
