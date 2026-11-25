@@ -1,5 +1,5 @@
 {
-  "surum": "3.15.0",
-  "tarih": "2026-11-25",
-  "not": "Beyin haritası (#graf), Markdown okuyucu (.md-okuma), İşlem Kayıtları (#makbuzlar), Hafıza okuyucu (#hafiza), Yardım (#yardim), Güncelleme denetimi (#guncelleme), özel başlık, BeNKaYS geliştirici kartı ve @ajan selamlama tetikleyicisi eklendi."
+  "surum": "3.15.1",
+  "tarih": "2026-11-26",
+  "not": "Graf (#graf) modül eşleşmesi düzeltildi (850-Companion -> Hafıza) ve boş kalan Kayıtlar filtresi Görevler (tasks) olarak güncellendi."
 }

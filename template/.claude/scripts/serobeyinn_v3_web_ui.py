@@ -297,8 +297,8 @@ meter { width: 100%; height: 10px; }
 .graf-lejant .graf-filtre.secili { border-color: var(--limon); color: var(--limon); background: var(--panel-2); font-weight: 600; }
 .graf-lejant i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; }
 .graf-lejant .n-knowledge { background: #f9d71c; }
+.graf-lejant .n-tasks { background: #67df70; }
 .graf-lejant .n-daily { background: #8ab4f8; }
-.graf-lejant .n-receipts { background: #67df70; }
 .graf-lejant .n-companion { background: #ffb4ab; }
 .graf-lejant .n-diger { background: #7dd3fc; }
 @media (max-width: 1100px) { .graf-ikili { grid-template-columns: 1fr; } #graf-icerik { max-height: 50vh; } }
@@ -1245,9 +1245,16 @@ APP_JS = r"""
   }
 
   // --- graf -------------------------------------------------------------
-  const GRAF_RENK = { knowledge: '#f9d71c', daily: '#8ab4f8', receipts: '#67df70', companion: '#ffb4ab', 'kök': '#7dd3fc' };
-  const GRAF_ETIKET = { knowledge: 'Bilgi', daily: 'Günlük', receipts: 'Kayıtlar', companion: 'Hafıza', diger: 'Diğer' };
-  function grafKategori(tur) { return (tur in GRAF_ETIKET && tur !== 'diger') ? tur : 'diger'; }
+  const GRAF_RENK = { knowledge: '#f9d71c', tasks: '#67df70', daily: '#8ab4f8', companion: '#ffb4ab', diger: '#7dd3fc' };
+  const GRAF_ETIKET = { knowledge: 'Bilgi', tasks: 'Görevler', daily: 'Günlük', companion: 'Hafıza', diger: 'Diğer' };
+  function grafKategori(tur) {
+    const k = String(tur || '').toLowerCase();
+    if (k === 'knowledge' || k.includes('knowledge')) { return 'knowledge'; }
+    if (k === 'tasks' || k.includes('task')) { return 'tasks'; }
+    if (k === 'daily' || k.includes('daily')) { return 'daily'; }
+    if (k === 'companion' || k.includes('companion')) { return 'companion'; }
+    return 'diger';
+  }
   function grafEtiket(tur) { return GRAF_ETIKET[grafKategori(tur)] || 'Diğer'; }
   const BEYIN_SAG = [
     [0.03, -0.84], [0.11, -0.96], [0.24, -0.99], [0.35, -0.95], [0.48, -0.92],
@@ -1270,7 +1277,7 @@ APP_JS = r"""
   let aktifGraf = null;
   let grafMod = 'beyin';
   let grafDinleyiciKuruldu = false;
-  function grafRenk(tur) { return GRAF_RENK[tur] || '#7dd3fc'; }
+  function grafRenk(tur) { return GRAF_RENK[grafKategori(tur)] || '#7dd3fc'; }
 
   function metinHash(s) {
     let h = 2166136261;
@@ -1321,11 +1328,12 @@ APP_JS = r"""
   }
 
   function beyinHedef(tur, hash, solSayi, sagSayi) {
+    const kat = grafKategori(tur);
     let taraf, yMerkez, yYay;
-    if (tur === 'knowledge') { taraf = -1; yMerkez = -0.22; yYay = 0.56; }
-    else if (tur === 'companion') { taraf = 1; yMerkez = -0.45; yYay = 0.38; }
-    else if (tur === 'daily') { taraf = 1; yMerkez = 0.05; yYay = 0.42; }
-    else if (tur === 'receipts') { taraf = 1; yMerkez = 0.54; yYay = 0.32; }
+    if (kat === 'knowledge') { taraf = -1; yMerkez = -0.22; yYay = 0.56; }
+    else if (kat === 'companion') { taraf = 1; yMerkez = -0.45; yYay = 0.38; }
+    else if (kat === 'daily') { taraf = 1; yMerkez = 0.05; yYay = 0.42; }
+    else if (kat === 'tasks') { taraf = 1; yMerkez = 0.54; yYay = 0.32; }
     else { taraf = (hash % 2 === 0) ? -1 : 1; yMerkez = 0.25; yYay = 0.55; }
     // Tek kategori baskınsa iki yarımküreyi dengeli doldur.
     if (solSayi === 0 || sagSayi === 0) { taraf = (hash % 2 === 0) ? -1 : 1; yMerkez = 0; yYay = 0.78; }
@@ -1346,8 +1354,9 @@ APP_JS = r"""
     const m = beyinMetrik(genislik, yukseklik);
     let solAday = 0, sagAday = 0;
     veri.dugumler.forEach(function (n) {
-      if (n.tur === 'knowledge') { solAday += 1; }
-      else if (n.tur === 'companion' || n.tur === 'daily' || n.tur === 'receipts') { sagAday += 1; }
+      const kat = grafKategori(n.tur);
+      if (kat === 'knowledge') { solAday += 1; }
+      else if (kat === 'companion' || kat === 'daily' || kat === 'tasks') { sagAday += 1; }
       else { solAday += 1; sagAday += 1; }
     });
     const dugumler = veri.dugumler.map(function (n) {
@@ -2296,8 +2305,8 @@ _INDEX = """<!DOCTYPE html>
             <span id="graf-notu" class="aciklama"></span>
             <span id="graf-lejant" class="graf-lejant" role="group" aria-label="Modül seçimi">
               <button type="button" class="graf-filtre" data-tur="knowledge" aria-pressed="false"><i class="n-knowledge"></i>Bilgi</button>
+              <button type="button" class="graf-filtre" data-tur="tasks" aria-pressed="false"><i class="n-tasks"></i>Görevler</button>
               <button type="button" class="graf-filtre" data-tur="daily" aria-pressed="false"><i class="n-daily"></i>Günlük</button>
-              <button type="button" class="graf-filtre" data-tur="receipts" aria-pressed="false"><i class="n-receipts"></i>Kayıtlar</button>
               <button type="button" class="graf-filtre" data-tur="companion" aria-pressed="false"><i class="n-companion"></i>Hafıza</button>
               <button type="button" class="graf-filtre" data-tur="diger" aria-pressed="false"><i class="n-diger"></i>Diğer</button>
             </span>
@@ -2433,7 +2442,7 @@ _INDEX = """<!DOCTYPE html>
           <p>Kasandaki eşitlenmiş notları ve aralarındaki <code>[[wiki]]</code> / Markdown bağlantılarını iki yarımküreli beyin haritasında gösterir.</p>
           <ul>
             <li><strong>Mod: Beyin / Serbest:</strong> Beyin haritası ile serbest ağ görünümü arasında geçiş yapar.</li>
-            <li><strong>Modül filtreleri:</strong> <code>Bilgi</code>, <code>Günlük</code>, <code>Kayıtlar</code>, <code>Hafıza</code>, <code>Diğer</code> düğmelerine tıklayınca ilgili düğümler vurgulanır.</li>
+            <li><strong>Modül filtreleri:</strong> <code>Bilgi</code>, <code>Görevler</code>, <code>Günlük</code>, <code>Hafıza</code>, <code>Diğer</code> düğmelerine tıklayınca ilgili düğümler vurgulanır.</li>
             <li><strong>Etkileşim:</strong> Sürükleyerek gez, tekerlekle yakınlaştır, <code>Ortala</code> ile sıfırla; düğüme tıklayınca sağda Markdown önizleme açılır.</li>
           </ul>
         </div>
